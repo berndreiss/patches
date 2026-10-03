@@ -1,0 +1,483 @@
+From 50255dfd2e611f359c427565b70988b9a34f242b Mon Sep 17 00:00:00 2001
+From: "okbob@github.com" <pavel.stehule@gmail.com>
+Date: Wed, 12 Aug 2026 07:03:28 +0200
+Subject: [PATCH] introduce 'tam' modifier for date/timestamp formatting
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+glibc returns localized month names in the genitive case, but it also
+provides alternative month names in the nominative case. The TAM prefix
+allows you to retrieve this alternative name.
+
+example:
+
+SELECT to_char(date '2026-08-01', 'TMMONTH');
+┌─────────┐
+│ to_char │
+╞═════════╡
+│ SRPNA   │
+└─────────┘
+(1 row)
+
+SELECT to_char(date '2026-08-01', 'TAMMONTH');
+┌─────────┐
+│ to_char │
+╞═════════╡
+│ SRPEN   │
+└─────────┘
+(1 row)
+---
+ doc/src/sgml/func/func-formatting.sgml        |  31 +++-
+ src/backend/utils/adt/formatting.c            | 142 ++++++++++++++----
+ src/backend/utils/adt/pg_locale.c             |  16 +-
+ src/include/utils/pg_locale.h                 |   2 +
+ .../regress/expected/collate.linux.utf8.out   |  40 +++++
+ src/test/regress/sql/collate.linux.utf8.sql   |  14 ++
+ 6 files changed, 216 insertions(+), 29 deletions(-)
+
+diff --git a/doc/src/sgml/func/func-formatting.sgml b/doc/src/sgml/func/func-formatting.sgml
+index e4edaf4f42c..563587dc617 100644
+--- a/doc/src/sgml/func/func-formatting.sgml
++++ b/doc/src/sgml/func/func-formatting.sgml
+@@ -477,6 +477,12 @@
+          <xref linkend="guc-lc-time"/>)</entry>
+         <entry><literal>TMMonth</literal></entry>
+        </row>
++       <row>
++        <entry><literal>TAM</literal> prefix</entry>
++        <entry>translation alternative mode (use localized alternative month names based on
++         <xref linkend="guc-lc-time"/>; see usage notes)</entry>
++        <entry><literal>TAMMonth</literal></entry>
++       </row>
+        <row>
+         <entry><literal>SP</literal> suffix</entry>
+         <entry>spell mode (not implemented)</entry>
+@@ -504,8 +510,29 @@
+ 
+      <listitem>
+       <para>
+-       <literal>TM</literal> suppresses trailing blanks whether or
+-       not <literal>FM</literal> is specified.
++       <literal>TM</literal> and <literal>TAM</literal> suppress trailing
++       blanks whether or not <literal>FM</literal> is specified.
++      </para>
++     </listitem>
++
++     <listitem>
++      <para>
++       <literal>TM</literal> and <literal>TAM</literal> both produce
++       localized month names according to <xref linkend="guc-lc-time"/>,
++       but they can differ for certain languages that inflect month names
++       (e.g., Slavic languages).  In such languages <literal>TM</literal>
++       produces the form used together with a day number, which is often the
++       genitive case, while <literal>TAM</literal> produces the standalone
++       (nominative) form.  For example, with <literal>lc_time</literal> set to
++       a Czech locale, <literal>to_char('2026-08-01'::date, 'TMMONTH')</literal>
++       returns <literal>SRPNA</literal> (genitive), whereas
++       <literal>to_char('2026-08-01'::date, 'TAMMONTH')</literal> returns
++       <literal>SRPEN</literal> (nominative).  For languages that do not draw
++       this distinction, and for the <literal>C</literal> locale, the two
++       modifiers produce the same result.  This distinction relies on
++       alternative month names being available from the underlying operating
++       system's locale support, so <literal>TAM</literal> may not be effective
++       on all platforms.
+       </para>
+      </listitem>
+ 
+diff --git a/src/backend/utils/adt/formatting.c b/src/backend/utils/adt/formatting.c
+index f87c0e53f56..2df90a7343d 100644
+--- a/src/backend/utils/adt/formatting.c
++++ b/src/backend/utils/adt/formatting.c
+@@ -547,6 +547,7 @@ do { \
+ #define DCH_SUFFIX_th	0x04
+ #define DCH_SUFFIX_SP	0x08
+ #define DCH_SUFFIX_TM	0x10
++#define DCH_SUFFIX_TAM	0x20
+ 
+ /*
+  * Suffix tests
+@@ -588,16 +589,25 @@ IS_SUFFIX_TM(uint8 _s)
+ 	return (_s & DCH_SUFFIX_TM);
+ }
+ 
++static inline bool
++IS_SUFFIX_TAM(uint8 _s)
++{
++	return (_s & DCH_SUFFIX_TAM);
++}
++
+ /*
+  * Suffixes definition for DATE-TIME TO/FROM CHAR
+  */
+ #define TM_SUFFIX_LEN	2
++#define TAM_SUFFIX_LEN	3
+ 
+ static const KeySuffix DCH_suff[] = {
+ 	{"FM", 2, DCH_SUFFIX_FM, SUFFTYPE_PREFIX},
+ 	{"fm", 2, DCH_SUFFIX_FM, SUFFTYPE_PREFIX},
+ 	{"TM", TM_SUFFIX_LEN, DCH_SUFFIX_TM, SUFFTYPE_PREFIX},
++	{"TAM", TAM_SUFFIX_LEN, DCH_SUFFIX_TAM, SUFFTYPE_PREFIX},
+ 	{"tm", 2, DCH_SUFFIX_TM, SUFFTYPE_PREFIX},
++	{"tam", 3, DCH_SUFFIX_TAM, SUFFTYPE_PREFIX},
+ 	{"TH", 2, DCH_SUFFIX_TH, SUFFTYPE_POSTFIX},
+ 	{"th", 2, DCH_SUFFIX_th, SUFFTYPE_POSTFIX},
+ 	{"SP", 2, DCH_SUFFIX_SP, SUFFTYPE_POSTFIX},
+@@ -2581,6 +2591,44 @@ from_char_seq_search(int *dest, const char **src, const char *const *array,
+ 	return true;
+ }
+ 
++/*
++ * Allow to choose localized names or alternative localized names by
++ * usage prefix TM or TAM. Simple code, just reduction of repeated code.
++ */
++static char **
++get_localized_abbrev_months(uint8 suffix)
++{
++	if (IS_SUFFIX_TM(suffix))
++	{
++		return localized_abbrev_months;
++	}
++	else if (IS_SUFFIX_TAM(suffix))
++	{
++		return localized_alt_abbrev_months;
++	}
++	else
++	{
++		return NULL;
++	}
++}
++
++static char **
++get_localized_full_months(uint8 suffix)
++{
++	if (IS_SUFFIX_TM(suffix))
++	{
++		return localized_full_months;
++	}
++	else if (IS_SUFFIX_TAM(suffix))
++	{
++		return localized_alt_full_months;
++	}
++	else
++	{
++		return NULL;
++	}
++}
++
+ /*
+  * Process a TmToChar struct as denoted by a list of FormatNodes.
+  * The formatted data is appended to 'out'.
+@@ -2769,8 +2817,13 @@ DCH_to_char(const FormatNode *node, bool is_interval, Oid collid,
+ 				INVALID_FOR_INTERVAL;
+ 				if (!tm->tm_mon)
+ 					break;
+-				if (IS_SUFFIX_TM(n->suffix))
+-					DCH_EMITS(str_toupper_z(localized_full_months[tm->tm_mon - 1], collid));
++				if (IS_SUFFIX_TM(n->suffix) || IS_SUFFIX_TAM(n->suffix))
++				{
++					char	   **localized_months;
++
++					localized_months = get_localized_full_months(n->suffix);
++					DCH_EMITS(str_toupper_z(localized_months[tm->tm_mon - 1], collid));
++				}
+ 				else
+ 					DCH_EMITF("%*s", IS_SUFFIX_FM(n->suffix) ? 0 : -9,
+ 							  asc_toupper_z(months_full[tm->tm_mon - 1]));
+@@ -2779,8 +2832,13 @@ DCH_to_char(const FormatNode *node, bool is_interval, Oid collid,
+ 				INVALID_FOR_INTERVAL;
+ 				if (!tm->tm_mon)
+ 					break;
+-				if (IS_SUFFIX_TM(n->suffix))
+-					DCH_EMITS(str_initcap_z(localized_full_months[tm->tm_mon - 1], collid));
++				if (IS_SUFFIX_TM(n->suffix) || IS_SUFFIX_TAM(n->suffix))
++				{
++					char	   **localized_months;
++
++					localized_months = get_localized_full_months(n->suffix);
++					DCH_EMITS(str_initcap_z(localized_months[tm->tm_mon - 1], collid));
++				}
+ 				else
+ 					DCH_EMITF("%*s", IS_SUFFIX_FM(n->suffix) ? 0 : -9,
+ 							  months_full[tm->tm_mon - 1]);
+@@ -2789,8 +2847,13 @@ DCH_to_char(const FormatNode *node, bool is_interval, Oid collid,
+ 				INVALID_FOR_INTERVAL;
+ 				if (!tm->tm_mon)
+ 					break;
+-				if (IS_SUFFIX_TM(n->suffix))
+-					DCH_EMITS(str_tolower_z(localized_full_months[tm->tm_mon - 1], collid));
++				if (IS_SUFFIX_TM(n->suffix) || IS_SUFFIX_TAM(n->suffix))
++				{
++					char	   **localized_months;
++
++					localized_months = get_localized_full_months(n->suffix);
++					DCH_EMITS(str_tolower_z(localized_months[tm->tm_mon - 1], collid));
++				}
+ 				else
+ 					DCH_EMITF("%*s", IS_SUFFIX_FM(n->suffix) ? 0 : -9,
+ 							  asc_tolower_z(months_full[tm->tm_mon - 1]));
+@@ -2799,8 +2862,13 @@ DCH_to_char(const FormatNode *node, bool is_interval, Oid collid,
+ 				INVALID_FOR_INTERVAL;
+ 				if (!tm->tm_mon)
+ 					break;
+-				if (IS_SUFFIX_TM(n->suffix))
+-					DCH_EMITS(str_toupper_z(localized_abbrev_months[tm->tm_mon - 1], collid));
++				if (IS_SUFFIX_TM(n->suffix) || IS_SUFFIX_TAM(n->suffix))
++				{
++					char	   **localized_months;
++
++					localized_months = get_localized_abbrev_months(n->suffix);
++					DCH_EMITS(str_toupper_z(localized_months[tm->tm_mon - 1], collid));
++				}
+ 				else
+ 					DCH_EMITS(asc_toupper_z(months[tm->tm_mon - 1]));
+ 				break;
+@@ -2808,8 +2876,13 @@ DCH_to_char(const FormatNode *node, bool is_interval, Oid collid,
+ 				INVALID_FOR_INTERVAL;
+ 				if (!tm->tm_mon)
+ 					break;
+-				if (IS_SUFFIX_TM(n->suffix))
+-					DCH_EMITS(str_initcap_z(localized_abbrev_months[tm->tm_mon - 1], collid));
++				if (IS_SUFFIX_TM(n->suffix) || IS_SUFFIX_TAM(n->suffix))
++				{
++					char	   **localized_months;
++
++					localized_months = get_localized_abbrev_months(n->suffix);
++					DCH_EMITS(str_initcap_z(localized_months[tm->tm_mon - 1], collid));
++				}
+ 				else
+ 					DCH_EMITS(months[tm->tm_mon - 1]);
+ 				break;
+@@ -2817,8 +2890,13 @@ DCH_to_char(const FormatNode *node, bool is_interval, Oid collid,
+ 				INVALID_FOR_INTERVAL;
+ 				if (!tm->tm_mon)
+ 					break;
+-				if (IS_SUFFIX_TM(n->suffix))
+-					DCH_EMITS(str_tolower_z(localized_abbrev_months[tm->tm_mon - 1], collid));
++				if (IS_SUFFIX_TM(n->suffix) || IS_SUFFIX_TAM(n->suffix))
++				{
++					char	   **localized_months;
++
++					localized_months = get_localized_abbrev_months(n->suffix);
++					DCH_EMITS(str_tolower_z(localized_months[tm->tm_mon - 1], collid));
++				}
+ 				else
+ 					DCH_EMITS(asc_tolower_z(months[tm->tm_mon - 1]));
+ 				break;
+@@ -3413,24 +3491,36 @@ DCH_from_char(FormatNode *node, const char *in, TmFromChar *out,
+ 			case DCH_MONTH:
+ 			case DCH_Month:
+ 			case DCH_month:
+-				if (!from_char_seq_search(&value, &s, months_full,
+-										  IS_SUFFIX_TM(n->suffix) ? localized_full_months : NULL,
+-										  collid,
+-										  n, escontext))
+-					return;
+-				if (!from_char_set_int(&out->mm, value + 1, n, escontext))
+-					return;
++				{
++					char	  **localized_months;
++
++					localized_months = get_localized_full_months(n->suffix);
++
++					if (!from_char_seq_search(&value, &s, months_full,
++											  localized_months,
++											  collid,
++											  n, escontext))
++						return;
++					if (!from_char_set_int(&out->mm, value + 1, n, escontext))
++						return;
++				}
+ 				break;
+ 			case DCH_MON:
+ 			case DCH_Mon:
+ 			case DCH_mon:
+-				if (!from_char_seq_search(&value, &s, months,
+-										  IS_SUFFIX_TM(n->suffix) ? localized_abbrev_months : NULL,
+-										  collid,
+-										  n, escontext))
+-					return;
+-				if (!from_char_set_int(&out->mm, value + 1, n, escontext))
+-					return;
++				{
++					char	   **localized_months;
++
++					localized_months = get_localized_abbrev_months(n->suffix);
++
++					if (!from_char_seq_search(&value, &s, months,
++											  localized_months,
++											  collid,
++											  n, escontext))
++						return;
++					if (!from_char_set_int(&out->mm, value + 1, n, escontext))
++						return;
++				}
+ 				break;
+ 			case DCH_MM:
+ 				if (from_char_parse_int(&out->mm, &s, n, escontext) < 0)
+diff --git a/src/backend/utils/adt/pg_locale.c b/src/backend/utils/adt/pg_locale.c
+index 4f0d0ca5057..ebfa17f292b 100644
+--- a/src/backend/utils/adt/pg_locale.c
++++ b/src/backend/utils/adt/pg_locale.c
+@@ -101,7 +101,9 @@ int			icu_validation_level = WARNING;
+ char	   *localized_abbrev_days[7 + 1];
+ char	   *localized_full_days[7 + 1];
+ char	   *localized_abbrev_months[12 + 1];
++char	   *localized_alt_abbrev_months[12 + 1];
+ char	   *localized_full_months[12 + 1];
++char	   *localized_alt_full_months[12 + 1];
+ 
+ static pg_locale_t default_locale = NULL;
+ 
+@@ -701,7 +703,7 @@ cache_single_string(char **dst, const char *src, int encoding)
+ void
+ cache_locale_time(void)
+ {
+-	char		buf[(2 * 7 + 2 * 12) * MAX_L10N_DATA];
++	char		buf[(2 * 7 + 4 * 12) * MAX_L10N_DATA];
+ 	char	   *bufptr;
+ 	time_t		timenow;
+ 	struct tm  *timeinfo;
+@@ -765,9 +767,15 @@ cache_locale_time(void)
+ 		if (strftime_l(bufptr, MAX_L10N_DATA, "%b", timeinfo, locale) <= 0)
+ 			strftimefail = true;
+ 		bufptr += MAX_L10N_DATA;
++		if (strftime_l(bufptr, MAX_L10N_DATA, "%Ob", timeinfo, locale) <= 0)
++			strftimefail = true;
++		bufptr += MAX_L10N_DATA;
+ 		if (strftime_l(bufptr, MAX_L10N_DATA, "%B", timeinfo, locale) <= 0)
+ 			strftimefail = true;
+ 		bufptr += MAX_L10N_DATA;
++		if (strftime_l(bufptr, MAX_L10N_DATA, "%OB", timeinfo, locale) <= 0)
++			strftimefail = true;
++		bufptr += MAX_L10N_DATA;
+ 	}
+ 
+ #ifdef WIN32
+@@ -822,11 +830,17 @@ cache_locale_time(void)
+ 	{
+ 		cache_single_string(&localized_abbrev_months[i], bufptr, encoding);
+ 		bufptr += MAX_L10N_DATA;
++		cache_single_string(&localized_alt_abbrev_months[i], bufptr, encoding);
++		bufptr += MAX_L10N_DATA;
+ 		cache_single_string(&localized_full_months[i], bufptr, encoding);
+ 		bufptr += MAX_L10N_DATA;
++		cache_single_string(&localized_alt_full_months[i], bufptr, encoding);
++		bufptr += MAX_L10N_DATA;
+ 	}
+ 	localized_abbrev_months[12] = NULL;
++	localized_alt_abbrev_months[12] = NULL;
+ 	localized_full_months[12] = NULL;
++	localized_alt_full_months[12] = NULL;
+ 
+ 	CurrentLCTimeValid = true;
+ }
+diff --git a/src/include/utils/pg_locale.h b/src/include/utils/pg_locale.h
+index fcd508f5dd6..57100d668d0 100644
+--- a/src/include/utils/pg_locale.h
++++ b/src/include/utils/pg_locale.h
+@@ -42,7 +42,9 @@ extern PGDLLIMPORT int icu_validation_level;
+ extern PGDLLIMPORT char *localized_abbrev_days[];
+ extern PGDLLIMPORT char *localized_full_days[];
+ extern PGDLLIMPORT char *localized_abbrev_months[];
++extern PGDLLIMPORT char *localized_alt_abbrev_months[];
+ extern PGDLLIMPORT char *localized_full_months[];
++extern PGDLLIMPORT char *localized_alt_full_months[];
+ 
+ extern bool check_locale(int category, const char *locale, char **canonname);
+ extern char *pg_perm_setlocale(int category, const char *locale);
+diff --git a/src/test/regress/expected/collate.linux.utf8.out b/src/test/regress/expected/collate.linux.utf8.out
+index e0a39e4c300..f4b0d60ea4c 100644
+--- a/src/test/regress/expected/collate.linux.utf8.out
++++ b/src/test/regress/expected/collate.linux.utf8.out
+@@ -463,7 +463,28 @@ SELECT to_char(date '2010-04-01', 'DD TMMON YYYY' COLLATE "tr_TR");
+  01 NİS 2010
+ (1 row)
+ 
++-- to_char
++SET lc_time TO 'cs_CZ';
++SELECT to_char(date '2010-02-01', 'DD TMMONTH');
++ to_char  
++----------
++ 01 ÚNORA
++(1 row)
++
++SELECT to_char(date '2010-02-01', 'TAMMONTH');
++ to_char 
++---------
++ ÚNOR
++(1 row)
++
++SELECT to_char(date '2010-02-01', 'TAMMON');
++ to_char 
++---------
++ ÚNO
++(1 row)
++
+ -- to_date
++SET lc_time TO 'tr_TR';
+ SELECT to_date('01 ŞUB 2010', 'DD TMMON YYYY');
+   to_date   
+ ------------
+@@ -497,6 +518,25 @@ SELECT to_date('2010 01 araLık', 'YYYY DD TMMONTH');
+  12-01-2010
+ (1 row)
+ 
++SET lc_time TO 'cs_CZ';
++SELECT to_date('1 srpna 2010', 'DD TMMONTH YYYY');
++  to_date   
++------------
++ 08-01-2010
++(1 row)
++
++SELECT to_date('1 srp 2010', 'DD TAMMON YYYY');
++  to_date   
++------------
++ 08-01-2010
++(1 row)
++
++SELECT to_date('1 srpen 2010', 'DD TAMMONTH YYYY');
++  to_date   
++------------
++ 08-01-2010
++(1 row)
++
+ -- backwards parsing
+ CREATE VIEW collview1 AS SELECT * FROM collate_test1 WHERE b COLLATE "C" >= 'bbc';
+ CREATE VIEW collview2 AS SELECT a, b FROM collate_test1 ORDER BY b COLLATE "C";
+diff --git a/src/test/regress/sql/collate.linux.utf8.sql b/src/test/regress/sql/collate.linux.utf8.sql
+index 6d726ee9c99..544679fede5 100644
+--- a/src/test/regress/sql/collate.linux.utf8.sql
++++ b/src/test/regress/sql/collate.linux.utf8.sql
+@@ -182,7 +182,15 @@ SELECT to_char(date '2010-02-01', 'DD TMMON YYYY' COLLATE "tr_TR");
+ SELECT to_char(date '2010-04-01', 'DD TMMON YYYY');
+ SELECT to_char(date '2010-04-01', 'DD TMMON YYYY' COLLATE "tr_TR");
+ 
++-- to_char
++SET lc_time TO 'cs_CZ';
++
++SELECT to_char(date '2010-02-01', 'DD TMMONTH');
++SELECT to_char(date '2010-02-01', 'TAMMONTH');
++SELECT to_char(date '2010-02-01', 'TAMMON');
++
+ -- to_date
++SET lc_time TO 'tr_TR';
+ 
+ SELECT to_date('01 ŞUB 2010', 'DD TMMON YYYY');
+ SELECT to_date('01 Şub 2010', 'DD TMMON YYYY');
+@@ -192,6 +200,12 @@ SELECT to_date('01 Aralık 2010', 'DD TMMONTH YYYY');
+ SELECT to_date('01 aralık 2010', 'DD TMMONTH YYYY');
+ SELECT to_date('2010 01 araLık', 'YYYY DD TMMONTH');
+ 
++SET lc_time TO 'cs_CZ';
++
++SELECT to_date('1 srpna 2010', 'DD TMMONTH YYYY');
++SELECT to_date('1 srp 2010', 'DD TAMMON YYYY');
++SELECT to_date('1 srpen 2010', 'DD TAMMONTH YYYY');
++
+ -- backwards parsing
+ 
+ CREATE VIEW collview1 AS SELECT * FROM collate_test1 WHERE b COLLATE "C" >= 'bbc';
+-- 
+2.55.0
+

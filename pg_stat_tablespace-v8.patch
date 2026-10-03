@@ -1,0 +1,1892 @@
+From 0397601bb6ef8baada6a6928d4a5a1220aba7e61 Mon Sep 17 00:00:00 2001
+From: Shihao <zhong950419@gmail.com>
+Date: Fri, 18 Sep 2026 22:52:17 -0400
+Subject: [PATCH v8] Add pg_stat_tablespace statistics view
+
+pg_stat_io reports activity by object and context but not by tablespace.
+There is no way to see which tablespace a workload is hitting, which
+matters when tablespaces sit on storage with different performance.
+
+Add a variable-numbered stats kind that keeps, per tablespace, blocks read
+and hit, block read and write time, temporary file count and size, and
+the tuple counters.  The pg_stat_tablespace view exposes them.
+
+Block and tuple counts are added when relation and index stats are
+flushed, so the totals track pg_stat_database.  An index is credited to
+its own tablespace.  A temporary file is credited to the tablespace it was
+created in, which is taken from the file path.
+
+Block read and write times are reported from the buffer manager, so the
+checkpointer and the background writer report them too.  Those processes
+never call pgstat_report_stat(), so a pending entry there would never be
+flushed and would keep a dropped tablespace's entry alive.  The times are
+kept in process-local memory instead and flushed through flush_static_cb.
+The checkpointer and the background writer flush them where they report
+their own stats.  pgstat_count_io_op_time() now returns the elapsed time,
+so the clock is read only once.
+
+pgstat_relation_update_tablespace() keeps the recorded tablespace current
+when a relation is moved.  A relation moved in the middle of a transaction
+has that transaction's counts credited to the tablespace it ends up in.
+
+This adds a pg_proc entry, so catversion needs a bump at commit.
+---
+ doc/src/sgml/monitoring.sgml                  | 229 +++++++++++++
+ src/backend/catalog/system_views.sql          |  19 ++
+ src/backend/commands/tablespace.c             |   7 +
+ src/backend/storage/buffer/bufmgr.c           |  20 +-
+ src/backend/storage/buffer/localbuf.c         |  10 +-
+ src/backend/storage/file/fd.c                 |   2 +-
+ src/backend/utils/activity/Makefile           |   1 +
+ src/backend/utils/activity/meson.build        |   1 +
+ src/backend/utils/activity/pgstat.c           |  18 +
+ src/backend/utils/activity/pgstat_database.c  |  13 +-
+ src/backend/utils/activity/pgstat_index.c     |  15 +
+ src/backend/utils/activity/pgstat_io.c        |  23 ++
+ src/backend/utils/activity/pgstat_relation.c  |  46 ++-
+ src/backend/utils/activity/pgstat_shmem.c     |   6 +-
+ .../utils/activity/pgstat_tablespace.c        | 323 ++++++++++++++++++
+ src/backend/utils/adt/pgstatfuncs.c           |  79 ++++-
+ src/backend/utils/cache/relcache.c            |  16 +
+ src/include/catalog/pg_proc.dat               |   8 +
+ src/include/pgstat.h                          |  39 ++-
+ src/include/utils/backend_status.h            |   2 +-
+ src/include/utils/pgstat_internal.h           |  17 +
+ src/include/utils/pgstat_kind.h               |  15 +-
+ src/test/recovery/t/029_stats_restart.pl      |  31 ++
+ src/test/regress/expected/rules.out           |  16 +
+ src/test/regress/expected/stats.out           | 152 ++++++++-
+ src/test/regress/expected/tablespace.out      |  38 +++
+ src/test/regress/sql/stats.sql                |  78 +++++
+ src/test/regress/sql/tablespace.sql           |  21 ++
+ src/tools/pgindent/typedefs.list              |   3 +
+ 29 files changed, 1208 insertions(+), 40 deletions(-)
+ create mode 100644 src/backend/utils/activity/pgstat_tablespace.c
+
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index 0d038de1a23..6d129890388 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -555,6 +555,15 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
+       </entry>
+      </row>
+ 
++     <row>
++      <entry><structname>pg_stat_tablespace</structname><indexterm><primary>pg_stat_tablespace</primary></indexterm></entry>
++      <entry>One row per tablespace, showing statistics about blocks, temporary
++       files and tuples for relations in that tablespace. See
++       <link linkend="monitoring-pg-stat-tablespace-view">
++       <structname>pg_stat_tablespace</structname></link> for details.
++      </entry>
++     </row>
++
+      <row>
+       <entry><structname>pg_stat_subscription_stats</structname><indexterm><primary>pg_stat_subscription_stats</primary></indexterm></entry>
+       <entry>One row per subscription, showing statistics about errors and conflicts.
+@@ -5732,6 +5741,220 @@ description | Waiting for a newly initialized WAL file to reach durable storage
+ 
+  </sect2>
+ 
++  <sect2 id="monitoring-pg-stat-tablespace-view">
++   <title><structname>pg_stat_tablespace</structname></title>
++
++   <indexterm>
++    <primary>pg_stat_tablespace</primary>
++   </indexterm>
++
++   <para>
++    The <structname>pg_stat_tablespace</structname> view will contain one row
++    for each tablespace in the cluster, showing statistics about blocks read
++    and hit, temporary file usage, and tuples read and written for relations
++    stored in that tablespace.
++   </para>
++
++   <para>
++    Note that temporary files are attributed to the tablespace they were
++    created in, which is controlled by <xref linkend="guc-temp-tablespaces"/>,
++    and is not necessarily the tablespace of any relation involved in the
++    query.
++   </para>
++
++   <table id="pg-stat-tablespace-view" xreflabel="pg_stat_tablespace">
++    <title><structname>pg_stat_tablespace</structname> View</title>
++    <tgroup cols="1">
++     <thead>
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         Column Type
++        </para>
++        <para>
++         Description
++        </para>
++       </entry>
++      </row>
++     </thead>
++
++     <tbody>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>tablespace_id</structfield> <type>oid</type>
++        </para>
++        <para>
++         OID of this tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>tablespace_name</structfield> <type>name</type>
++        </para>
++        <para>
++         Name of this tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>blks_read</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of disk blocks read in this tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>blks_hit</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of times disk blocks were found already in the buffer cache, so
++         that a read was not necessary (this only includes hits in the
++         PostgreSQL buffer cache, not the operating system's file system
++         cache)
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>blk_read_time</structfield> <type>double precision</type>
++        </para>
++        <para>
++         Time spent reading data file blocks in this tablespace, in
++         milliseconds (if <xref linkend="guc-track-io-timing"/> is enabled,
++         otherwise zero)
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>blk_write_time</structfield> <type>double precision</type>
++        </para>
++        <para>
++         Time spent writing and extending data file blocks in this tablespace,
++         in milliseconds (if <xref linkend="guc-track-io-timing"/> is enabled,
++         otherwise zero).  Unlike
++         <structname>pg_stat_database</structname>.<structfield>blk_write_time</structfield>,
++         this includes writes done by the checkpointer and the background
++         writer, so the two do not add up.
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>temp_files</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of temporary files created in this tablespace.  All temporary
++         files are counted, regardless of why the temporary file was created,
++         and regardless of the <xref linkend="guc-log-temp-files"/> setting.
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>temp_bytes</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Total amount of data written to temporary files in this tablespace.
++         All temporary files are counted, regardless of why the temporary file
++         was created, and regardless of the
++         <xref linkend="guc-log-temp-files"/> setting.
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>tup_returned</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of live rows fetched by sequential scans and index entries
++         returned by index scans for relations in this tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>tup_fetched</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of live rows fetched by index scans for relations in this
++         tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>tup_inserted</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of rows inserted into relations in this tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>tup_updated</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of rows updated in relations in this tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>tup_deleted</structfield> <type>bigint</type>
++        </para>
++        <para>
++         Number of rows deleted from relations in this tablespace
++        </para>
++       </entry>
++      </row>
++
++      <row>
++       <entry role="catalog_table_entry">
++        <para role="column_definition">
++         <structfield>stats_reset</structfield> <type>timestamp with time zone</type>
++        </para>
++        <para>
++         Time at which these statistics were last reset
++        </para>
++       </entry>
++      </row>
++     </tbody>
++    </tgroup>
++   </table>
++  </sect2>
++
+  <sect2 id="monitoring-stats-functions">
+   <title>Statistics Functions</title>
+ 
+@@ -6025,6 +6248,12 @@ description | Waiting for a newly initialized WAL file to reach durable storage
+           <structname>pg_stat_slru</structname> view.
+          </para>
+         </listitem>
++        <listitem>
++         <para>
++          <literal>tablespace</literal>: Reset all the counters shown in the
++          <structname>pg_stat_tablespace</structname> view.
++         </para>
++        </listitem>
+         <listitem>
+          <para>
+           <literal>wal</literal>: Reset all the counters shown in the
+diff --git a/src/backend/catalog/system_views.sql b/src/backend/catalog/system_views.sql
+index ad340887f54..149004f873d 100644
+--- a/src/backend/catalog/system_views.sql
++++ b/src/backend/catalog/system_views.sql
+@@ -1146,6 +1146,25 @@ CREATE VIEW pg_stat_replication_slots AS
+         LATERAL pg_stat_get_replication_slot(slot_name) as s
+     WHERE r.datoid IS NOT NULL; -- excluding physical slots
+ 
++CREATE VIEW pg_stat_tablespace AS
++    SELECT
++        T.oid AS tablespace_id,
++        T.spcname AS tablespace_name,
++        S.blks_fetched - S.blks_hit AS blks_read,
++        S.blks_hit,
++        S.blk_read_time,
++        S.blk_write_time,
++        S.temp_files,
++        S.temp_bytes,
++        S.tup_returned,
++        S.tup_fetched,
++        S.tup_inserted,
++        S.tup_updated,
++        S.tup_deleted,
++        S.stats_reset
++    FROM pg_tablespace T,
++        LATERAL pg_stat_get_tablespace(T.oid) S;
++
+ CREATE VIEW pg_stat_database AS
+     SELECT
+             D.oid AS datid,
+diff --git a/src/backend/commands/tablespace.c b/src/backend/commands/tablespace.c
+index e01fb2db913..cda910e86f0 100644
+--- a/src/backend/commands/tablespace.c
++++ b/src/backend/commands/tablespace.c
+@@ -68,6 +68,7 @@
+ #include "commands/tablespace.h"
+ #include "common/file_perm.h"
+ #include "miscadmin.h"
++#include "pgstat.h"
+ #include "postmaster/bgwriter.h"
+ #include "storage/fd.h"
+ #include "storage/lmgr.h"
+@@ -363,6 +364,9 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
+ 	/* Post creation hook for new tablespace */
+ 	InvokeObjectPostCreateHook(TableSpaceRelationId, tablespaceoid, 0);
+ 
++	/* Keep the cumulative stats system up-to-date */
++	pgstat_create_tablespace(tablespaceoid);
++
+ 	create_tablespace_directories(location, tablespaceoid);
+ 
+ 	/* Record the filesystem change in XLOG */
+@@ -551,6 +555,9 @@ DropTableSpace(DropTableSpaceStmt *stmt)
+ 		(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_DROP);
+ 	}
+ 
++	/* Keep the cumulative stats system up-to-date */
++	pgstat_drop_tablespace(tablespaceoid);
++
+ 	/*
+ 	 * Note: because we checked that the tablespace was empty, there should be
+ 	 * no need to worry about flushing shared buffers or free space map
+diff --git a/src/backend/storage/buffer/bufmgr.c b/src/backend/storage/buffer/bufmgr.c
+index 5c82865a084..b56f63e0a64 100644
+--- a/src/backend/storage/buffer/bufmgr.c
++++ b/src/backend/storage/buffer/bufmgr.c
+@@ -1833,8 +1833,9 @@ WaitReadBuffers(ReadBuffersOperation *operation)
+ 				 * itself was already counted earlier in AsyncReadBuffers() --
+ 				 * either by us or by another backend if this is a foreign IO.
+ 				 */
+-				pgstat_count_io_op_time(io_object, io_context, IOOP_READ,
+-										io_start, 0, 0);
++				pgstat_count_io_op_time_ext(io_object, io_context, IOOP_READ,
++											io_start, 0, 0,
++											operation->smgr->smgr_rlocator.locator.spcOid);
+ 			}
+ 			else
+ 			{
+@@ -2153,8 +2154,9 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
+ 	smgrstartreadv(ioh, operation->smgr, forknum,
+ 				   blocknum,
+ 				   io_pages, io_buffers_len);
+-	pgstat_count_io_op_time(io_object, io_context, IOOP_READ,
+-							io_start, 1, io_buffers_len * BLCKSZ);
++	pgstat_count_io_op_time_ext(io_object, io_context, IOOP_READ,
++								io_start, 1, io_buffers_len * BLCKSZ,
++								operation->smgr->smgr_rlocator.locator.spcOid);
+ 
+ 	if (persistence == RELPERSISTENCE_TEMP)
+ 		pgBufferUsage.local_blks_read += io_buffers_len;
+@@ -3041,8 +3043,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
+ 	if (!(flags & EB_SKIP_EXTENSION_LOCK))
+ 		UnlockRelationForExtension(bmr.rel, ExclusiveLock);
+ 
+-	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_EXTEND,
+-							io_start, 1, extend_by * BLCKSZ);
++	pgstat_count_io_op_time_ext(IOOBJECT_RELATION, io_context, IOOP_EXTEND,
++								io_start, 1, extend_by * BLCKSZ,
++								BMR_GET_SMGR(bmr)->smgr_rlocator.locator.spcOid);
+ 
+ 	/* Set BM_VALID, terminate IO, and wake up any waiters */
+ 	for (uint32 i = 0; i < extend_by; i++)
+@@ -4621,8 +4624,9 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+ 	 * When a strategy is not in use, the write can only be a "regular" write
+ 	 * of a dirty shared buffer (IOCONTEXT_NORMAL IOOP_WRITE).
+ 	 */
+-	pgstat_count_io_op_time(io_object, io_context,
+-							IOOP_WRITE, io_start, 1, BLCKSZ);
++	pgstat_count_io_op_time_ext(io_object, io_context,
++								IOOP_WRITE, io_start, 1, BLCKSZ,
++								reln->smgr_rlocator.locator.spcOid);
+ 
+ 	pgBufferUsage.shared_blks_written++;
+ 
+diff --git a/src/backend/storage/buffer/localbuf.c b/src/backend/storage/buffer/localbuf.c
+index 4870c8e13d0..40420dd7827 100644
+--- a/src/backend/storage/buffer/localbuf.c
++++ b/src/backend/storage/buffer/localbuf.c
+@@ -212,8 +212,9 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
+ 			  false);
+ 
+ 	/* Temporary table I/O does not use Buffer Access Strategies */
+-	pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL,
+-							IOOP_WRITE, io_start, 1, BLCKSZ);
++	pgstat_count_io_op_time_ext(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL,
++								IOOP_WRITE, io_start, 1, BLCKSZ,
++								reln->smgr_rlocator.locator.spcOid);
+ 
+ 	/* Mark not-dirty */
+ 	TerminateLocalBufferIO(bufHdr, true, 0, false);
+@@ -469,8 +470,9 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
+ 	/* actually extend relation */
+ 	smgrzeroextend(BMR_GET_SMGR(bmr), fork, first_block, extend_by, false);
+ 
+-	pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL, IOOP_EXTEND,
+-							io_start, 1, extend_by * BLCKSZ);
++	pgstat_count_io_op_time_ext(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL, IOOP_EXTEND,
++								io_start, 1, extend_by * BLCKSZ,
++								BMR_GET_SMGR(bmr)->smgr_rlocator.locator.spcOid);
+ 
+ 	for (uint32 i = 0; i < extend_by; i++)
+ 	{
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index 190c9974494..58fa52afbeb 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -1515,7 +1515,7 @@ FileAccess(File file)
+ static void
+ ReportTemporaryFileUsage(const char *path, pgoff_t size)
+ {
+-	pgstat_report_tempfile(size);
++	pgstat_report_tempfile(size, path);
+ 
+ 	if (log_temp_files >= 0)
+ 	{
+diff --git a/src/backend/utils/activity/Makefile b/src/backend/utils/activity/Makefile
+index 2e32d1485d6..e3292a22219 100644
+--- a/src/backend/utils/activity/Makefile
++++ b/src/backend/utils/activity/Makefile
+@@ -34,6 +34,7 @@ OBJS = \
+ 	pgstat_shmem.o \
+ 	pgstat_slru.o \
+ 	pgstat_subscription.o \
++	pgstat_tablespace.o \
+ 	pgstat_wal.o \
+ 	pgstat_xact.o \
+ 	wait_event.o \
+diff --git a/src/backend/utils/activity/meson.build b/src/backend/utils/activity/meson.build
+index e6dcb2e26fc..3049bdf4887 100644
+--- a/src/backend/utils/activity/meson.build
++++ b/src/backend/utils/activity/meson.build
+@@ -19,6 +19,7 @@ backend_sources += files(
+   'pgstat_shmem.c',
+   'pgstat_slru.c',
+   'pgstat_subscription.c',
++  'pgstat_tablespace.c',
+   'pgstat_wal.c',
+   'pgstat_xact.c',
+ )
+diff --git a/src/backend/utils/activity/pgstat.c b/src/backend/utils/activity/pgstat.c
+index 6dd13ab9dec..0969ed564cd 100644
+--- a/src/backend/utils/activity/pgstat.c
++++ b/src/backend/utils/activity/pgstat.c
+@@ -301,6 +301,24 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
+ 		.reset_timestamp_cb = pgstat_database_reset_timestamp_cb,
+ 	},
+ 
++	[PGSTAT_KIND_TABLESPACE] = {
++		.name = "tablespace",
++
++		.fixed_amount = false,
++		.write_to_file = true,
++		/* so pg_stat_tablespace can be read from any database */
++		.accessed_across_databases = true,
++
++		.shared_size = sizeof(PgStatShared_Tablespace),
++		.shared_data_off = offsetof(PgStatShared_Tablespace, stats),
++		.shared_data_len = sizeof(((PgStatShared_Tablespace *) 0)->stats),
++		.pending_size = sizeof(PgStat_StatTabspaceEntry),
++
++		.flush_pending_cb = pgstat_tablespace_flush_cb,
++		.flush_static_cb = pgstat_flush_tablespace_times,
++		.reset_timestamp_cb = pgstat_tablespace_reset_timestamp_cb,
++	},
++
+ 	[PGSTAT_KIND_RELATION] = {
+ 		.name = "relation",
+ 
+diff --git a/src/backend/utils/activity/pgstat_database.c b/src/backend/utils/activity/pgstat_database.c
+index 7f3bc016593..58a0efa3e88 100644
+--- a/src/backend/utils/activity/pgstat_database.c
++++ b/src/backend/utils/activity/pgstat_database.c
+@@ -218,9 +218,10 @@ pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
+  * Report creation of temporary file.
+  */
+ void
+-pgstat_report_tempfile(size_t filesize)
++pgstat_report_tempfile(size_t filesize, const char *path)
+ {
+ 	PgStat_StatDBEntry *dbent;
++	Oid			spcoid;
+ 
+ 	if (!pgstat_track_counts)
+ 		return;
+@@ -228,6 +229,16 @@ pgstat_report_tempfile(size_t filesize)
+ 	dbent = pgstat_prep_database_pending(MyDatabaseId);
+ 	dbent->temp_bytes += filesize;
+ 	dbent->temp_files++;
++
++	spcoid = pgstat_tablespace_from_tempfile_path(path);
++	if (OidIsValid(spcoid))
++	{
++		PgStat_StatTabspaceEntry *tsent;
++
++		tsent = pgstat_prep_tablespace_pending(spcoid);
++		tsent->temp_bytes += filesize;
++		tsent->temp_files++;
++	}
+ }
+ 
+ /*
+diff --git a/src/backend/utils/activity/pgstat_index.c b/src/backend/utils/activity/pgstat_index.c
+index a1f9a4c6ac1..c40cbce9641 100644
+--- a/src/backend/utils/activity/pgstat_index.c
++++ b/src/backend/utils/activity/pgstat_index.c
+@@ -80,6 +80,21 @@ pgstat_index_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
+ 	dbentry->blocks_fetched += lstats->idx.blocks_fetched;
+ 	dbentry->blocks_hit += lstats->idx.blocks_hit;
+ 
++	/*
++	 * Likewise for the tablespace the index lives in, which need not be the
++	 * one holding the table.
++	 */
++	if (OidIsValid(lstats->tablespace_oid))
++	{
++		PgStat_StatTabspaceEntry *tsentry;
++
++		tsentry = pgstat_prep_tablespace_pending(lstats->tablespace_oid);
++		tsentry->tuples_returned += lstats->idx.tuples_returned;
++		tsentry->tuples_fetched += lstats->idx.tuples_fetched;
++		tsentry->blocks_fetched += lstats->idx.blocks_fetched;
++		tsentry->blocks_hit += lstats->idx.blocks_hit;
++	}
++
+ 	return true;
+ }
+ 
+diff --git a/src/backend/utils/activity/pgstat_io.c b/src/backend/utils/activity/pgstat_io.c
+index 8ec1aad5078..f511fba8580 100644
+--- a/src/backend/utils/activity/pgstat_io.c
++++ b/src/backend/utils/activity/pgstat_io.c
+@@ -113,6 +113,20 @@ pgstat_prepare_io_time(bool track_io_guc)
+ void
+ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
+ 						instr_time start_time, uint32 cnt, uint64 bytes)
++{
++	pgstat_count_io_op_time_ext(io_object, io_context, io_op, start_time,
++								cnt, bytes, InvalidOid);
++}
++
++/*
++ * Like pgstat_count_io_op_time() except the time is also credited to
++ * tablespace "spcoid", for pg_stat_tablespace.  The buffer manager uses this
++ * for relation I/O; everything else passes InvalidOid.
++ */
++void
++pgstat_count_io_op_time_ext(IOObject io_object, IOContext io_context,
++							IOOp io_op, instr_time start_time,
++							uint32 cnt, uint64 bytes, Oid spcoid)
+ {
+ 	if (!INSTR_TIME_IS_ZERO(start_time))
+ 	{
+@@ -147,6 +161,10 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
+ 		/* Add the per-backend count */
+ 		pgstat_count_backend_io_op_time(io_object, io_context, io_op,
+ 										io_time);
++
++		/* Add the per-tablespace count */
++		if (OidIsValid(spcoid))
++			pgstat_count_tablespace_io_op_time(spcoid, io_op, io_time);
+ 	}
+ 
+ 	pgstat_count_io_op(io_object, io_context, io_op, cnt, bytes);
+@@ -162,11 +180,16 @@ pgstat_fetch_stat_io(void)
+ 
+ /*
+  * Simpler wrapper of pgstat_io_flush_cb()
++ *
++ * This also flushes the per-tablespace I/O times counted along with the I/O
++ * statistics, as some of the processes calling this, like the checkpointer
++ * and the background writer, never call pgstat_report_stat().
+  */
+ void
+ pgstat_flush_io(bool nowait)
+ {
+ 	(void) pgstat_io_flush_cb(nowait);
++	(void) pgstat_flush_tablespace_times(nowait);
+ }
+ 
+ /*
+diff --git a/src/backend/utils/activity/pgstat_relation.c b/src/backend/utils/activity/pgstat_relation.c
+index 5c70543ba88..e81be834d62 100644
+--- a/src/backend/utils/activity/pgstat_relation.c
++++ b/src/backend/utils/activity/pgstat_relation.c
+@@ -37,12 +37,14 @@ typedef struct TwoPhasePgStatRecord
+ 	PgStat_Counter updated_pre_truncdrop;
+ 	PgStat_Counter deleted_pre_truncdrop;
+ 	Oid			id;				/* table's OID */
++	Oid			tablespace_oid; /* table's tablespace OID */
+ 	bool		shared;			/* is it a shared catalog? */
+ 	bool		truncdropped;	/* was the relation truncated/dropped? */
+ } TwoPhasePgStatRecord;
+ 
+ 
+ static PgStat_RelationStatus *pgstat_prep_relation_pending(PgStat_Kind kind,
++														   Oid tablespace_oid,
+ 														   Oid rel_id, bool isshared);
+ static void add_tabstat_xact_level(PgStat_RelationStatus *pgstat_info, int nest_level);
+ static void ensure_tabstat_xact_level(PgStat_RelationStatus *pgstat_info);
+@@ -179,6 +181,7 @@ pgstat_assoc_relation(Relation rel)
+ 
+ 	/* find or make the PgStat_RelationStatus entry, and update link */
+ 	rel->pgstat_info = pgstat_prep_relation_pending(kind,
++													rel->rd_locator.spcOid,
+ 													RelationGetRelid(rel),
+ 													rel->rd_rel->relisshared);
+ 
+@@ -206,6 +209,21 @@ pgstat_unlink_relation(Relation rel)
+ 	rel->pgstat_info = NULL;
+ }
+ 
++/*
++ * Refresh the tablespace recorded in a relation's pending statistics.
++ *
++ * pgstat_assoc_relation() records the tablespace once, when the pending entry
++ * is first created, but a relation can subsequently be moved to a different
++ * tablespace.  RelationRebuildRelation() preserves pgstat_info across a rebuild,
++ * so without this the entry would keep crediting the old tablespace.
++ */
++void
++pgstat_relation_update_tablespace(Relation rel)
++{
++	if (rel->pgstat_info != NULL)
++		rel->pgstat_info->tablespace_oid = rel->rd_locator.spcOid;
++}
++
+ /*
+  * Ensure that stats are dropped if transaction aborts.
+  */
+@@ -780,6 +798,7 @@ AtPrepare_PgStat_Relations(PgStat_SubXactStatus *xact_state)
+ 		record.updated_pre_truncdrop = trans->updated_pre_truncdrop;
+ 		record.deleted_pre_truncdrop = trans->deleted_pre_truncdrop;
+ 		record.id = relstat->tab.id;
++		record.tablespace_oid = relstat->tablespace_oid;
+ 		record.shared = relstat->tab.shared;
+ 		record.truncdropped = trans->truncdropped;
+ 
+@@ -823,7 +842,9 @@ pgstat_twophase_postcommit(FullTransactionId fxid, uint16 info,
+ 	PgStat_RelationStatus *pgstat_info;
+ 
+ 	/* Find or create a relstat entry for the rel */
+-	pgstat_info = pgstat_prep_relation_pending(PGSTAT_KIND_RELATION, rec->id, rec->shared);
++	pgstat_info = pgstat_prep_relation_pending(PGSTAT_KIND_RELATION,
++											   rec->tablespace_oid, rec->id,
++											   rec->shared);
+ 
+ 	/* Same math as in AtEOXact_PgStat, commit case */
+ 	pgstat_info->tab.counts_xact.tuples_inserted += rec->tuples_inserted;
+@@ -859,7 +880,9 @@ pgstat_twophase_postabort(FullTransactionId fxid, uint16 info,
+ 	PgStat_RelationStatus *pgstat_info;
+ 
+ 	/* Find or create a relstat entry for the rel */
+-	pgstat_info = pgstat_prep_relation_pending(PGSTAT_KIND_RELATION, rec->id, rec->shared);
++	pgstat_info = pgstat_prep_relation_pending(PGSTAT_KIND_RELATION,
++											   rec->tablespace_oid, rec->id,
++											   rec->shared);
+ 
+ 	/* Same math as in AtEOXact_PgStat, abort case */
+ 	if (rec->truncdropped)
+@@ -975,6 +998,21 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
+ 	dbentry->blocks_fetched += lstats->tab.counts.blocks_fetched;
+ 	dbentry->blocks_hit += lstats->tab.counts.blocks_hit;
+ 
++	/* Likewise for the tablespace the relation lives in */
++	if (OidIsValid(lstats->tablespace_oid))
++	{
++		PgStat_StatTabspaceEntry *tsentry;
++
++		tsentry = pgstat_prep_tablespace_pending(lstats->tablespace_oid);
++		tsentry->tuples_returned += lstats->tab.counts.tuples_returned;
++		tsentry->tuples_fetched += lstats->tab.counts.tuples_fetched;
++		tsentry->tuples_inserted += lstats->tab.counts_xact.tuples_inserted;
++		tsentry->tuples_updated += lstats->tab.counts_xact.tuples_updated;
++		tsentry->tuples_deleted += lstats->tab.counts_xact.tuples_deleted;
++		tsentry->blocks_fetched += lstats->tab.counts.blocks_fetched;
++		tsentry->blocks_hit += lstats->tab.counts.blocks_hit;
++	}
++
+ 	return true;
+ }
+ 
+@@ -998,7 +1036,8 @@ pgstat_relation_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
+  * initialized if not exists.
+  */
+ static PgStat_RelationStatus *
+-pgstat_prep_relation_pending(PgStat_Kind kind, Oid rel_id, bool isshared)
++pgstat_prep_relation_pending(PgStat_Kind kind, Oid tablespace_oid, Oid rel_id,
++							 bool isshared)
+ {
+ 	PgStat_EntryRef *entry_ref;
+ 	PgStat_RelationStatus *pending;
+@@ -1008,6 +1047,7 @@ pgstat_prep_relation_pending(PgStat_Kind kind, Oid rel_id, bool isshared)
+ 										  rel_id, NULL);
+ 	pending = entry_ref->pending;
+ 	pending->kind = kind;
++	pending->tablespace_oid = tablespace_oid;
+ 	if (kind != PGSTAT_KIND_INDEX)
+ 	{
+ 		pending->tab.id = rel_id;
+diff --git a/src/backend/utils/activity/pgstat_shmem.c b/src/backend/utils/activity/pgstat_shmem.c
+index 1858d68f918..5013393acea 100644
+--- a/src/backend/utils/activity/pgstat_shmem.c
++++ b/src/backend/utils/activity/pgstat_shmem.c
+@@ -50,8 +50,6 @@ static void pgstat_drop_database_and_contents(Oid dboid);
+ static void pgstat_free_entry(PgStatShared_HashEntry *shent, dshash_seq_status *hstat);
+ 
+ static void pgstat_release_entry_ref(PgStat_HashKey key, PgStat_EntryRef *entry_ref, bool discard_pending);
+-static bool pgstat_need_entry_refs_gc(void);
+-static void pgstat_gc_entry_refs(void);
+ static void pgstat_release_all_entry_refs(bool discard_pending);
+ typedef bool (*ReleaseMatchCB) (PgStat_EntryRefHashEntry *, Datum data);
+ static void pgstat_release_matching_entry_refs(bool discard_pending, ReleaseMatchCB match, Datum match_data);
+@@ -800,7 +798,7 @@ pgstat_request_entry_refs_gc(void)
+ 	pg_atomic_fetch_add_u64(&pgStatLocal.shmem->gc_request_count, 1);
+ }
+ 
+-static bool
++bool
+ pgstat_need_entry_refs_gc(void)
+ {
+ 	uint64		curage;
+@@ -816,7 +814,7 @@ pgstat_need_entry_refs_gc(void)
+ 	return pgStatSharedRefAge != curage;
+ }
+ 
+-static void
++void
+ pgstat_gc_entry_refs(void)
+ {
+ 	pgstat_entry_ref_hash_iterator i;
+diff --git a/src/backend/utils/activity/pgstat_tablespace.c b/src/backend/utils/activity/pgstat_tablespace.c
+new file mode 100644
+index 00000000000..0201444fad5
+--- /dev/null
++++ b/src/backend/utils/activity/pgstat_tablespace.c
+@@ -0,0 +1,323 @@
++/* -------------------------------------------------------------------------
++ *
++ * pgstat_tablespace.c
++ *	  Implementation of tablespace statistics.
++ *
++ * This file contains the implementation of tablespace statistics.  It is kept
++ * separate from other statistics implementations for the sake of readability.
++ *
++ * Tablespace statistics are aggregated from several sources: block and tuple
++ * counts are folded in when relation and index statistics are flushed, block
++ * I/O times are counted along with the I/O statistics, and temporary file
++ * usage is reported by fd.c.
++ *
++ * Relation, index and temporary file reports all happen in processes that call
++ * pgstat_report_stat(), so they use the ordinary pending entry mechanism.
++ * Block I/O times cannot: pgstat_count_io_op_time_ext() also counts them in
++ * the checkpointer and the background writer, which never call that function.
++ * A PgStat_EntryRef->pending entry created there would never be flushed, and
++ * would pin the shared entry for the life of the process, so a later DROP
++ * TABLESPACE could not free it (see the "cannot gc shared ref that has pending
++ * data" case in pgstat_gc_entry_refs()).  They are therefore accumulated in
++ * process-local memory, and flushed through flush_static_cb and whenever the
++ * I/O statistics are flushed by pgstat_flush_io().
++ *
++ * Copyright (c) 2026, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  src/backend/utils/activity/pgstat_tablespace.c
++ * -------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include "catalog/pg_tablespace_d.h"
++#include "common/relpath.h"
++#include "storage/fd.h"
++#include "utils/hsearch.h"
++#include "utils/memutils.h"
++#include "utils/pgstat_internal.h"
++#include "utils/timestamp.h"
++
++
++/*
++ * Block I/O timings not yet flushed to shared memory, keyed by tablespace.
++ */
++typedef struct PgStat_PendingTabspaceTime
++{
++	Oid			spcoid;			/* hash key, must be first */
++	PgStat_Counter blk_read_time;	/* times in microseconds */
++	PgStat_Counter blk_write_time;
++} PgStat_PendingTabspaceTime;
++
++static HTAB *pending_tabspace_times = NULL;
++
++/*
++ * The entry used last.  I/O tends to come in runs against the same
++ * tablespace, so this saves a hash lookup almost every time.
++ */
++static PgStat_PendingTabspaceTime *last_tabspace_time = NULL;
++
++
++static PgStat_PendingTabspaceTime *pgstat_prep_tablespace_time(Oid spcoid);
++
++
++/*
++ * Register the creation of a tablespace with the cumulative stats system.
++ *
++ * This does not materialize the entry -- that happens the first time something
++ * is reported for the tablespace.  What it does do is arrange for the entry to
++ * be removed if the transaction aborts, and reset any statistics left over
++ * from an earlier tablespace that happened to have the same OID.  The latter
++ * matters because pgstat_flush_tablespace_times() can recreate an entry for a
++ * tablespace that has just been dropped; see the comment there.
++ */
++void
++pgstat_create_tablespace(Oid spcoid)
++{
++	pgstat_create_transactional(PGSTAT_KIND_TABLESPACE, InvalidOid, spcoid);
++}
++
++/*
++ * Remove entry for the tablespace being dropped.
++ */
++void
++pgstat_drop_tablespace(Oid spcoid)
++{
++	pgstat_drop_transactional(PGSTAT_KIND_TABLESPACE, InvalidOid, spcoid);
++}
++
++/*
++ * Fetch tablespace statistics.
++ */
++PgStat_StatTabspaceEntry *
++pgstat_fetch_stat_tabspaceentry(Oid spcoid)
++{
++	return (PgStat_StatTabspaceEntry *)
++		pgstat_fetch_entry(PGSTAT_KIND_TABLESPACE, InvalidOid, spcoid, NULL);
++}
++
++/*
++ * Prepare for reporting tablespace stats.
++ */
++PgStat_StatTabspaceEntry *
++pgstat_prep_tablespace_pending(Oid spcoid)
++{
++	PgStat_EntryRef *entry_ref;
++
++	Assert(OidIsValid(spcoid));
++
++	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_TABLESPACE,
++										  InvalidOid, spcoid, NULL);
++
++	return (PgStat_StatTabspaceEntry *) entry_ref->pending;
++}
++
++/*
++ * Determine which tablespace a temporary file belongs to, based on its path.
++ *
++ * fd.c does not remember the tablespace a temporary file was created in -- by
++ * the time the file is deleted and its usage reported, only the path is still
++ * available.  Rather than widen Vfd, we recover the OID from the path.
++ *
++ * TempTablespacePath() builds these paths, and produces just two shapes: one
++ * rooted at PG_TBLSPC_DIR for a real tablespace, and one rooted in the data
++ * directory for the default tablespace.  Rather than hard-code the latter, we
++ * ask TempTablespacePath() itself what it looks like, so this stays correct if
++ * the layout ever changes.  Note that it also maps the global tablespace onto
++ * the default one, so temporary files never belong to pg_global.
++ *
++ * Returns InvalidOid if the path is not recognized, in which case the caller
++ * simply does not attribute the file to any tablespace.
++ */
++Oid
++pgstat_tablespace_from_tempfile_path(const char *path)
++{
++	char		defaultpath[MAXPGPATH];
++
++	if (path == NULL)
++		return InvalidOid;
++
++	if (strncmp(path, PG_TBLSPC_DIR_SLASH, strlen(PG_TBLSPC_DIR_SLASH)) == 0)
++		return atooid(path + strlen(PG_TBLSPC_DIR_SLASH));
++
++	TempTablespacePath(defaultpath, DEFAULTTABLESPACE_OID);
++	if (strncmp(path, defaultpath, strlen(defaultpath)) == 0)
++		return DEFAULTTABLESPACE_OID;
++
++	return InvalidOid;
++}
++
++/*
++ * Find or create the process-local pending block I/O timings for a tablespace.
++ */
++static PgStat_PendingTabspaceTime *
++pgstat_prep_tablespace_time(Oid spcoid)
++{
++	PgStat_PendingTabspaceTime *pending;
++	bool		found;
++
++	Assert(OidIsValid(spcoid));
++
++	if (pending_tabspace_times == NULL)
++	{
++		HASHCTL		ctl;
++
++		ctl.keysize = sizeof(Oid);
++		ctl.entrysize = sizeof(PgStat_PendingTabspaceTime);
++		ctl.hcxt = TopMemoryContext;
++		pending_tabspace_times = hash_create("Pending tablespace I/O timings",
++											 8, &ctl,
++											 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++	}
++
++	pending = hash_search(pending_tabspace_times, &spcoid, HASH_ENTER, &found);
++	if (!found)
++	{
++		pending->blk_read_time = 0;
++		pending->blk_write_time = 0;
++	}
++
++	return pending;
++}
++
++/*
++ * Count the time of a block I/O against a tablespace.
++ *
++ * Called from pgstat_count_io_op_time_ext(), only when I/O timing is enabled.
++ * As in pg_stat_database, reads count as read time, and writes and extends
++ * count as write time.
++ */
++void
++pgstat_count_tablespace_io_op_time(Oid spcoid, IOOp io_op, instr_time io_time)
++{
++	PgStat_PendingTabspaceTime *pending = last_tabspace_time;
++
++	Assert(OidIsValid(spcoid));
++
++	if (pending == NULL || pending->spcoid != spcoid)
++		pending = last_tabspace_time = pgstat_prep_tablespace_time(spcoid);
++
++	if (io_op == IOOP_READ)
++		pending->blk_read_time += INSTR_TIME_GET_MICROSEC(io_time);
++	else if (io_op == IOOP_WRITE || io_op == IOOP_EXTEND)
++		pending->blk_write_time += INSTR_TIME_GET_MICROSEC(io_time);
++}
++
++/*
++ * Flush out process-local block I/O timings.
++ *
++ * Returns true if some of them could not be flushed due to lock contention;
++ * those are kept and retried on the next call.
++ *
++ * The shared entry is created if it does not exist.  Not creating it is not an
++ * option: this also runs in the checkpointer and the background writer, and on
++ * a standby -- or on a tablespace whose relations have not reported anything
++ * yet -- nothing else would have created it, so the timings would be dropped
++ * on the floor.  Note that pgstat_create_tablespace() does not help here, as
++ * it only arranges for the entry to be removed should the transaction abort.
++ *
++ * The cost is that a tablespace dropped between the last I/O and this flush
++ * gets an entry created for an OID that no longer exists.  Such an entry holds
++ * nothing but the in-flight timings and is invisible in pg_stat_tablespace,
++ * which joins against pg_tablespace, but it does persist in the stats file.
++ * Should the OID ever be reused, pgstat_create_tablespace() resets it.
++ */
++bool
++pgstat_flush_tablespace_times(bool nowait)
++{
++	HASH_SEQ_STATUS hstat;
++	PgStat_PendingTabspaceTime *pending;
++	bool		partial_flush = false;
++
++	/*
++	 * Let go of references to entries dropped since the last call.  The
++	 * lookups below keep a reference to each entry they flush into, but
++	 * dropped entries are only noticed in pgstat_get_entry_ref().  If the
++	 * checkpointer still held such a reference at shutdown, the dropped entry
++	 * would be there when the stats file is written.
++	 */
++	if (pgstat_need_entry_refs_gc())
++		pgstat_gc_entry_refs();
++
++	if (pending_tabspace_times == NULL ||
++		hash_get_num_entries(pending_tabspace_times) == 0)
++		return false;
++
++	/* the entry it points to may be removed below */
++	last_tabspace_time = NULL;
++
++	hash_seq_init(&hstat, pending_tabspace_times);
++	while ((pending = hash_seq_search(&hstat)) != NULL)
++	{
++		PgStat_EntryRef *entry_ref;
++		PgStatShared_Tablespace *shent;
++		Oid			spcoid = pending->spcoid;
++
++		entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_TABLESPACE,
++												InvalidOid, spcoid, nowait);
++		if (entry_ref == NULL)
++		{
++			partial_flush = true;
++			continue;
++		}
++
++		shent = (PgStatShared_Tablespace *) entry_ref->shared_stats;
++		shent->stats.blk_read_time += pending->blk_read_time;
++		shent->stats.blk_write_time += pending->blk_write_time;
++
++		pgstat_unlock_entry(entry_ref);
++
++		/* deleting the entry the scan is sitting on is allowed */
++		(void) hash_search(pending_tabspace_times, &spcoid, HASH_REMOVE, NULL);
++	}
++
++	return partial_flush;
++}
++
++/*
++ * Flush out pending stats for the entry.
++ */
++bool
++pgstat_tablespace_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
++{
++	PgStatShared_Tablespace *sharedent;
++	PgStat_StatTabspaceEntry *pendingent;
++
++	pendingent = (PgStat_StatTabspaceEntry *) entry_ref->pending;
++	sharedent = (PgStatShared_Tablespace *) entry_ref->shared_stats;
++
++	if (!pgstat_lock_entry(entry_ref, nowait))
++		return false;
++
++#define PGSTAT_ACCUM_TABSPACECOUNT(item)		\
++	(sharedent)->stats.item += (pendingent)->item
++
++	/* blk_read_time and blk_write_time are flushed separately, see above */
++	PGSTAT_ACCUM_TABSPACECOUNT(blocks_fetched);
++	PGSTAT_ACCUM_TABSPACECOUNT(blocks_hit);
++	PGSTAT_ACCUM_TABSPACECOUNT(temp_files);
++	PGSTAT_ACCUM_TABSPACECOUNT(temp_bytes);
++	PGSTAT_ACCUM_TABSPACECOUNT(tuples_returned);
++	PGSTAT_ACCUM_TABSPACECOUNT(tuples_fetched);
++	PGSTAT_ACCUM_TABSPACECOUNT(tuples_inserted);
++	PGSTAT_ACCUM_TABSPACECOUNT(tuples_updated);
++	PGSTAT_ACCUM_TABSPACECOUNT(tuples_deleted);
++
++#undef PGSTAT_ACCUM_TABSPACECOUNT
++
++	pgstat_unlock_entry(entry_ref);
++
++	memset(pendingent, 0, sizeof(*pendingent));
++
++	return true;
++}
++
++/*
++ * Reset stats reset timestamp.
++ */
++void
++pgstat_tablespace_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
++{
++	((PgStatShared_Tablespace *) header)->stats.stat_reset_timestamp = ts;
++}
+diff --git a/src/backend/utils/adt/pgstatfuncs.c b/src/backend/utils/adt/pgstatfuncs.c
+index 64b6f60516c..22b93980c27 100644
+--- a/src/backend/utils/adt/pgstatfuncs.c
++++ b/src/backend/utils/adt/pgstatfuncs.c
+@@ -2098,6 +2098,7 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
+ 		pgstat_reset_of_kind(PGSTAT_KIND_LOCK);
+ 		XLogPrefetchResetStats();
+ 		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
++		pgstat_reset_of_kind(PGSTAT_KIND_TABLESPACE);
+ 		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
+ 
+ 		PG_RETURN_VOID();
+@@ -2119,13 +2120,15 @@ pg_stat_reset_shared(PG_FUNCTION_ARGS)
+ 		XLogPrefetchResetStats();
+ 	else if (strcmp(target, "slru") == 0)
+ 		pgstat_reset_of_kind(PGSTAT_KIND_SLRU);
++	else if (strcmp(target, "tablespace") == 0)
++		pgstat_reset_of_kind(PGSTAT_KIND_TABLESPACE);
+ 	else if (strcmp(target, "wal") == 0)
+ 		pgstat_reset_of_kind(PGSTAT_KIND_WAL);
+ 	else
+ 		ereport(ERROR,
+ 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+ 				 errmsg("unrecognized reset target: \"%s\"", target),
+-				 errhint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\", \"io\", \"lock\", \"recovery_prefetch\", \"slru\", or \"wal\".")));
++				 errhint("Target must be \"archiver\", \"bgwriter\", \"checkpointer\", \"io\", \"lock\", \"recovery_prefetch\", \"slru\", \"tablespace\", or \"wal\".")));
+ 
+ 	PG_RETURN_VOID();
+ }
+@@ -2493,6 +2496,80 @@ pg_stat_get_subscription_stats(PG_FUNCTION_ARGS)
+ 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+ }
+ 
++/*
++ * Returns statistics for the given tablespace.  If no statistics have been
++ * collected yet, all-zero stats are returned.
++ */
++Datum
++pg_stat_get_tablespace(PG_FUNCTION_ARGS)
++{
++#define PG_STAT_GET_TABLESPACE_COLS	12
++	Oid			spcoid = PG_GETARG_OID(0);
++	TupleDesc	tupdesc;
++	Datum		values[PG_STAT_GET_TABLESPACE_COLS] = {0};
++	bool		nulls[PG_STAT_GET_TABLESPACE_COLS] = {0};
++	PgStat_StatTabspaceEntry *tsentry;
++	PgStat_StatTabspaceEntry allzero;
++	int			i = 0;
++
++	tupdesc = CreateTemplateTupleDesc(PG_STAT_GET_TABLESPACE_COLS);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "blks_fetched",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "blks_hit",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "blk_read_time",
++					   FLOAT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "blk_write_time",
++					   FLOAT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "temp_files",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "temp_bytes",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "tup_returned",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 8, "tup_fetched",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 9, "tup_inserted",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 10, "tup_updated",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 11, "tup_deleted",
++					   INT8OID, -1, 0);
++	TupleDescInitEntry(tupdesc, (AttrNumber) 12, "stats_reset",
++					   TIMESTAMPTZOID, -1, 0);
++	TupleDescFinalize(tupdesc);
++	tupdesc = BlessTupleDesc(tupdesc);
++
++	tsentry = pgstat_fetch_stat_tabspaceentry(spcoid);
++	if (!tsentry)
++	{
++		memset(&allzero, 0, sizeof(PgStat_StatTabspaceEntry));
++		tsentry = &allzero;
++	}
++
++	values[i++] = Int64GetDatum(tsentry->blocks_fetched);
++	values[i++] = Int64GetDatum(tsentry->blocks_hit);
++	values[i++] = Float8GetDatum(pg_stat_us_to_ms(tsentry->blk_read_time));
++	values[i++] = Float8GetDatum(pg_stat_us_to_ms(tsentry->blk_write_time));
++	values[i++] = Int64GetDatum(tsentry->temp_files);
++	values[i++] = Int64GetDatum(tsentry->temp_bytes);
++	values[i++] = Int64GetDatum(tsentry->tuples_returned);
++	values[i++] = Int64GetDatum(tsentry->tuples_fetched);
++	values[i++] = Int64GetDatum(tsentry->tuples_inserted);
++	values[i++] = Int64GetDatum(tsentry->tuples_updated);
++	values[i++] = Int64GetDatum(tsentry->tuples_deleted);
++
++	if (tsentry->stat_reset_timestamp == 0)
++		nulls[i] = true;
++	else
++		values[i] = TimestampTzGetDatum(tsentry->stat_reset_timestamp);
++
++	Assert(i + 1 == PG_STAT_GET_TABLESPACE_COLS);
++
++	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
++#undef PG_STAT_GET_TABLESPACE_COLS
++}
++
+ /*
+  * Checks for presence of stats for object with provided kind, database oid,
+  * object oid.
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index d8f04a05309..73bdf6aa098 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -1354,6 +1354,15 @@ RelationInitPhysicalAddr(Relation relation)
+ 	else
+ 		relation->rd_locator.dbOid = MyDatabaseId;
+ 
++	/*
++	 * The relation may have been moved to another tablespace, so keep the
++	 * tablespace recorded for statistics purposes in step.  Paths that reload
++	 * an entry in place, such as RelationReloadIndexInfo(), reach here with a
++	 * live pgstat_info; RelationRebuildRelation() instead builds a fresh
++	 * entry and swaps pgstat_info back afterwards, so it repeats this itself.
++	 */
++	pgstat_relation_update_tablespace(relation);
++
+ 	if (relation->rd_rel->relfilenode)
+ 	{
+ 		/*
+@@ -2753,6 +2762,13 @@ RelationRebuildRelation(Relation relation)
+ 		/* pgstat_info / enabled must be preserved */
+ 		SWAPFIELD(struct PgStat_RelationStatus *, pgstat_info);
+ 		SWAPFIELD(bool, pgstat_enabled);
++
++		/*
++		 * RelationInitPhysicalAddr() ran on the newly built entry, which had
++		 * no pgstat_info yet, so redo the refresh now that the preserved
++		 * pgstat_info and the rebuilt rd_locator are on the same entry.
++		 */
++		pgstat_relation_update_tablespace(relation);
+ 		/* preserve old partition key if we have one */
+ 		if (keep_partkey)
+ 		{
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index f46427258e3..98b725b95b6 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -6119,6 +6119,14 @@
+   proargnames => '{name,blks_zeroed,blks_hit,blks_read,blks_written,blks_exists,flushes,truncates,stats_reset}',
+   prosrc => 'pg_stat_get_slru' },
+ 
++{ oid => '8463', descr => 'statistics: information about tablespace',
++  proname => 'pg_stat_get_tablespace', provolatile => 's',
++  proparallel => 'r', prorettype => 'record', proargtypes => 'oid',
++  proallargtypes => '{oid,int8,int8,float8,float8,int8,int8,int8,int8,int8,int8,int8,timestamptz}',
++  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o,o,o}',
++  proargnames => '{spcoid,blks_fetched,blks_hit,blk_read_time,blk_write_time,temp_files,temp_bytes,tup_returned,tup_fetched,tup_inserted,tup_updated,tup_deleted,stats_reset}',
++  prosrc => 'pg_stat_get_tablespace' },
++
+ { oid => '2978', descr => 'statistics: number of function calls',
+   proname => 'pg_stat_get_function_calls', provolatile => 's',
+   proparallel => 'r', prorettype => 'int8', proargtypes => 'oid',
+diff --git a/src/include/pgstat.h b/src/include/pgstat.h
+index 187d82c96fe..572576bf201 100644
+--- a/src/include/pgstat.h
++++ b/src/include/pgstat.h
+@@ -225,6 +225,7 @@ typedef struct PgStat_RelationStatus
+ {
+ 	PgStat_Kind kind;			/* PGSTAT_KIND_RELATION or PGSTAT_KIND_INDEX */
+ 	Relation	relation;		/* rel that is using this entry */
++	Oid			tablespace_oid; /* tablespace the relation lives in */
+ 	union
+ 	{
+ 		/* table counters */
+@@ -275,7 +276,7 @@ typedef struct PgStat_TableXactStatus
+  * ------------------------------------------------------------
+  */
+ 
+-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBD
++#define PGSTAT_FILE_FORMAT_ID	0x01A5BCBE
+ 
+ typedef struct PgStat_ArchiverStats
+ {
+@@ -459,6 +460,23 @@ typedef struct PgStat_StatDBEntry
+ 	TimestampTz stat_reset_timestamp;
+ } PgStat_StatDBEntry;
+ 
++typedef struct PgStat_StatTabspaceEntry
++{
++	PgStat_Counter blocks_fetched;
++	PgStat_Counter blocks_hit;
++	PgStat_Counter blk_read_time;	/* times in microseconds */
++	PgStat_Counter blk_write_time;
++	PgStat_Counter temp_files;
++	PgStat_Counter temp_bytes;
++	PgStat_Counter tuples_returned;
++	PgStat_Counter tuples_fetched;
++	PgStat_Counter tuples_inserted;
++	PgStat_Counter tuples_updated;
++	PgStat_Counter tuples_deleted;
++
++	TimestampTz stat_reset_timestamp;
++} PgStat_StatTabspaceEntry;
++
+ typedef struct PgStat_StatFuncEntry
+ {
+ 	PgStat_Counter numcalls;
+@@ -703,6 +721,9 @@ extern instr_time pgstat_prepare_io_time(bool track_io_guc);
+ extern void pgstat_count_io_op_time(IOObject io_object, IOContext io_context,
+ 									IOOp io_op, instr_time start_time,
+ 									uint32 cnt, uint64 bytes);
++extern void pgstat_count_io_op_time_ext(IOObject io_object, IOContext io_context,
++										IOOp io_op, instr_time start_time,
++										uint32 cnt, uint64 bytes, Oid spcoid);
+ 
+ extern PgStat_IO *pgstat_fetch_stat_io(void);
+ extern const char *pgstat_get_io_context_name(IOContext io_context);
+@@ -779,6 +800,7 @@ extern void pgstat_copy_relation_stats(Relation dst, Relation src);
+ extern void pgstat_init_relation(Relation rel);
+ extern void pgstat_assoc_relation(Relation rel);
+ extern void pgstat_unlink_relation(Relation rel);
++extern void pgstat_relation_update_tablespace(Relation rel);
+ 
+ extern void pgstat_report_vacuum(Relation rel, PgStat_Counter livetuples,
+ 								 PgStat_Counter deadtuples,
+@@ -885,6 +907,21 @@ extern PgStat_StatIdxEntry *pgstat_fetch_stat_idxentry_ext(bool shared,
+ 														   bool *may_free);
+ 
+ 
++/*
++ * Functions in pgstat_tablespace.c
++ */
++
++extern void pgstat_create_tablespace(Oid spcoid);
++extern void pgstat_drop_tablespace(Oid spcoid);
++extern PgStat_StatTabspaceEntry *pgstat_fetch_stat_tabspaceentry(Oid spcoid);
++extern PgStat_StatTabspaceEntry *pgstat_prep_tablespace_pending(Oid spcoid);
++extern Oid	pgstat_tablespace_from_tempfile_path(const char *path);
++
++/* used by pgstat_io.c for I/O times tracked per tablespace */
++extern void pgstat_count_tablespace_io_op_time(Oid spcoid, IOOp io_op,
++											   instr_time io_time);
++
++
+ /*
+  * Functions in pgstat_replslot.c
+  */
+diff --git a/src/include/utils/backend_status.h b/src/include/utils/backend_status.h
+index a334e096e4a..5ef7b5aaaed 100644
+--- a/src/include/utils/backend_status.h
++++ b/src/include/utils/backend_status.h
+@@ -315,7 +315,7 @@ extern void pgstat_clear_backend_activity_snapshot(void);
+ extern void pgstat_report_activity(BackendState state, const char *cmd_str);
+ extern void pgstat_report_query_id(int64 query_id, bool force);
+ extern void pgstat_report_plan_id(int64 plan_id, bool force);
+-extern void pgstat_report_tempfile(size_t filesize);
++extern void pgstat_report_tempfile(size_t filesize, const char *path);
+ extern void pgstat_report_appname(const char *appname);
+ extern void pgstat_report_xact_timestamp(TimestampTz tstamp);
+ extern const char *pgstat_get_backend_current_activity(int pid, bool checkUser);
+diff --git a/src/include/utils/pgstat_internal.h b/src/include/utils/pgstat_internal.h
+index 201e57279b1..5cbd538fddb 100644
+--- a/src/include/utils/pgstat_internal.h
++++ b/src/include/utils/pgstat_internal.h
+@@ -502,6 +502,12 @@ typedef struct PgStatShared_Database
+ 	PgStat_StatDBEntry stats;
+ } PgStatShared_Database;
+ 
++typedef struct PgStatShared_Tablespace
++{
++	PgStatShared_Common header;
++	PgStat_StatTabspaceEntry stats;
++} PgStatShared_Tablespace;
++
+ typedef struct PgStatShared_Relation
+ {
+ 	PgStatShared_Common header;
+@@ -753,6 +759,15 @@ extern bool pgstat_database_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
+ extern void pgstat_database_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
+ 
+ 
++/*
++ * Functions in pgstat_tablespace.c
++ */
++
++extern bool pgstat_tablespace_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
++extern bool pgstat_flush_tablespace_times(bool nowait);
++extern void pgstat_tablespace_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
++
++
+ /*
+  * Functions in pgstat_function.c
+  */
+@@ -839,6 +854,8 @@ extern void pgstat_reset_matching_entries(bool (*do_reset) (PgStatShared_HashEnt
+ 										  TimestampTz ts);
+ 
+ extern void pgstat_request_entry_refs_gc(void);
++extern bool pgstat_need_entry_refs_gc(void);
++extern void pgstat_gc_entry_refs(void);
+ extern dsa_pointer pgstat_alloc_entry_body(PgStat_Kind kind);
+ extern PgStatShared_Common *pgstat_init_entry(PgStat_Kind kind,
+ 											  PgStatShared_HashEntry *shhashent,
+diff --git a/src/include/utils/pgstat_kind.h b/src/include/utils/pgstat_kind.h
+index 45ca599d0dd..811b79f3b10 100644
+--- a/src/include/utils/pgstat_kind.h
++++ b/src/include/utils/pgstat_kind.h
+@@ -31,15 +31,16 @@
+ #define PGSTAT_KIND_REPLSLOT	5	/* per-slot statistics */
+ #define PGSTAT_KIND_SUBSCRIPTION	6	/* per-subscription statistics */
+ #define PGSTAT_KIND_BACKEND	7	/* per-backend statistics */
++#define PGSTAT_KIND_TABLESPACE	8	/* per-tablespace statistics */
+ 
+ /* stats for fixed-numbered objects */
+-#define PGSTAT_KIND_ARCHIVER	8
+-#define PGSTAT_KIND_BGWRITER	9
+-#define PGSTAT_KIND_CHECKPOINTER	10
+-#define PGSTAT_KIND_IO	11
+-#define PGSTAT_KIND_LOCK	12
+-#define PGSTAT_KIND_SLRU	13
+-#define PGSTAT_KIND_WAL	14
++#define PGSTAT_KIND_ARCHIVER	9
++#define PGSTAT_KIND_BGWRITER	10
++#define PGSTAT_KIND_CHECKPOINTER	11
++#define PGSTAT_KIND_IO	12
++#define PGSTAT_KIND_LOCK	13
++#define PGSTAT_KIND_SLRU	14
++#define PGSTAT_KIND_WAL	15
+ 
+ #define PGSTAT_KIND_BUILTIN_MIN PGSTAT_KIND_DATABASE
+ #define PGSTAT_KIND_BUILTIN_MAX PGSTAT_KIND_WAL
+diff --git a/src/test/recovery/t/029_stats_restart.pl b/src/test/recovery/t/029_stats_restart.pl
+index cdc427dbc78..a0e56bca817 100644
+--- a/src/test/recovery/t/029_stats_restart.pl
++++ b/src/test/recovery/t/029_stats_restart.pl
+@@ -293,6 +293,37 @@ cmp_ok(
+ 	$wal_restart_immediate->{reset},
+ 	"$sect: reset timestamp is new");
+ 
++
++## check that a tablespace written to by the checkpointer can be dropped
++## without breaking the shutdown.  The checkpointer keeps a reference to the
++## stats entries it flushes block write times into, and writing out the stats
++## file at shutdown expects dropped entries to be gone.
++
++$node->append_conf('postgresql.conf',
++	"track_io_timing = on\nallow_in_place_tablespaces = on");
++$node->restart;
++
++$sect = "dropped tablespace";
++$node->safe_psql($connect_db,
++	"CREATE TABLESPACE test_stats_tblspc LOCATION ''");
++my $spcoid = $node->safe_psql($connect_db,
++	"SELECT oid FROM pg_tablespace WHERE spcname = 'test_stats_tblspc'");
++$node->safe_psql($connect_db,
++	"CREATE TABLE tab_stats_tblspc TABLESPACE test_stats_tblspc AS SELECT generate_series(1,1000) AS a"
++);
++$node->safe_psql($connect_db, "CHECKPOINT");
++$node->safe_psql($connect_db, "DROP TABLE tab_stats_tblspc");
++$node->safe_psql($connect_db, "DROP TABLESPACE test_stats_tblspc");
++
++my $log_offset = -s $node->logfile;
++$node->stop;
++ok( !$node->log_contains(qr/terminated by signal/, $log_offset),
++	"$sect: clean shutdown");
++
++$node->start;
++is(have_stats('tablespace', 0, $spcoid),
++	'f', "$sect: tablespace stats do not exist");
++
+ $node->stop;
+ done_testing();
+ 
+diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
+index 4a8cc759d7b..2ed7172288f 100644
+--- a/src/test/regress/expected/rules.out
++++ b/src/test/regress/expected/rules.out
+@@ -2372,6 +2372,22 @@ pg_stat_sys_tables| SELECT relid,
+     stats_reset
+    FROM pg_stat_all_tables
+   WHERE ((schemaname = ANY (ARRAY['pg_catalog'::name, 'information_schema'::name])) OR (schemaname ~ '^pg_toast'::text));
++pg_stat_tablespace| SELECT t.oid AS tablespace_id,
++    t.spcname AS tablespace_name,
++    (s.blks_fetched - s.blks_hit) AS blks_read,
++    s.blks_hit,
++    s.blk_read_time,
++    s.blk_write_time,
++    s.temp_files,
++    s.temp_bytes,
++    s.tup_returned,
++    s.tup_fetched,
++    s.tup_inserted,
++    s.tup_updated,
++    s.tup_deleted,
++    s.stats_reset
++   FROM pg_tablespace t,
++    LATERAL pg_stat_get_tablespace(t.oid) s(blks_fetched, blks_hit, blk_read_time, blk_write_time, temp_files, temp_bytes, tup_returned, tup_fetched, tup_inserted, tup_updated, tup_deleted, stats_reset);
+ pg_stat_user_functions| SELECT p.oid AS funcid,
+     n.nspname AS schemaname,
+     p.proname AS funcname,
+diff --git a/src/test/regress/expected/stats.out b/src/test/regress/expected/stats.out
+index 8b15471248b..f59b426be9d 100644
+--- a/src/test/regress/expected/stats.out
++++ b/src/test/regress/expected/stats.out
+@@ -121,14 +121,15 @@ SELECT id, name, fixed_amount,
+   5 | replslot     | f            | t         | t
+   6 | subscription | f            | t         | t
+   7 | backend      | f            | t         | f
+-  8 | archiver     | t            | f         | t
+-  9 | bgwriter     | t            | f         | t
+- 10 | checkpointer | t            | f         | t
+- 11 | io           | t            | f         | t
+- 12 | lock         | t            | f         | t
+- 13 | slru         | t            | f         | t
+- 14 | wal          | t            | f         | t
+-(14 rows)
++  8 | tablespace   | f            | t         | t
++  9 | archiver     | t            | f         | t
++ 10 | bgwriter     | t            | f         | t
++ 11 | checkpointer | t            | f         | t
++ 12 | io           | t            | f         | t
++ 13 | lock         | t            | f         | t
++ 14 | slru         | t            | f         | t
++ 15 | wal          | t            | f         | t
++(15 rows)
+ 
+ -- ensure that both seqscan and indexscan plans are allowed
+ SET enable_seqscan TO on;
+@@ -1266,7 +1267,7 @@ SELECT stats_reset > :'wal_reset_ts'::timestamptz FROM pg_stat_wal;
+ -- Test error case for reset_shared with unknown stats type
+ SELECT pg_stat_reset_shared('unknown');
+ ERROR:  unrecognized reset target: "unknown"
+-HINT:  Target must be "archiver", "bgwriter", "checkpointer", "io", "lock", "recovery_prefetch", "slru", or "wal".
++HINT:  Target must be "archiver", "bgwriter", "checkpointer", "io", "lock", "recovery_prefetch", "slru", "tablespace", or "wal".
+ -- Test that reset works for pg_stat_database and pg_stat_database_conflicts
+ -- Since pg_stat_database stats_reset starts out as NULL, reset it once first so that we
+ -- have a baseline for comparison. The same for pg_stat_database_conflicts as it shares
+@@ -2154,4 +2155,137 @@ SELECT fastpath_exceeded > :backend_fastpath_exceeded_before
+ (1 row)
+ 
+ DROP TABLE part_test;
++-- Test pg_stat_tablespace
++-- pg_default and pg_global always exist
++SELECT tablespace_name FROM pg_stat_tablespace
++  WHERE tablespace_name IN ('pg_default', 'pg_global')
++  ORDER BY tablespace_name;
++ tablespace_name 
++-----------------
++ pg_default
++ pg_global
++(2 rows)
++
++-- Check only that the counters move, not by how much.  pg_stat_tablespace
++-- aggregates every relation in the tablespace and other sessions in this
++-- parallel group are busy in pg_default too, so no exact value is
++-- reproducible.  I/O timings are only collected with track_io_timing on.
++SET track_io_timing = on;
++SELECT tup_inserted AS ts_ins_before,
++       tup_updated AS ts_upd_before,
++       tup_deleted AS ts_del_before,
++       tup_returned AS ts_ret_before,
++       blks_hit AS ts_hit_before,
++       blk_write_time AS ts_wtime_before
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default' \gset
++-- Make the table big enough to be extended a number of times, as extending
++-- a relation is what counts as write time here.
++CREATE TABLE test_tablespace_stats (a int);
++INSERT INTO test_tablespace_stats SELECT generate_series(1, 10000);
++UPDATE test_tablespace_stats SET a = a + 1 WHERE a > 5000;
++DELETE FROM test_tablespace_stats WHERE a > 9000;
++SELECT count(*) > 0 FROM test_tablespace_stats;
++ ?column? 
++----------
++ t
++(1 row)
++
++SELECT pg_stat_force_next_flush();
++ pg_stat_force_next_flush 
++--------------------------
++ 
++(1 row)
++
++SELECT tup_inserted > :ts_ins_before AS inserts_counted,
++       tup_updated > :ts_upd_before AS updates_counted,
++       tup_deleted > :ts_del_before AS deletes_counted,
++       tup_returned > :ts_ret_before AS returns_counted,
++       blks_hit > :ts_hit_before AS hits_counted,
++       blk_write_time > :ts_wtime_before AS write_time_counted
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default';
++ inserts_counted | updates_counted | deletes_counted | returns_counted | hits_counted | write_time_counted 
++-----------------+-----------------+-----------------+-----------------+--------------+--------------------
++ t               | t               | t               | t               | t            | t
++(1 row)
++
++-- Block reads.  Moving the table to another tablespace rewrites it without
++-- going through shared buffers, so the SELECT has to read it back in, and
++-- those reads belong to the new tablespace.  Do this in a transaction to keep
++-- autovacuum from reading the rewritten table first.
++SELECT blks_read AS ts_read_before, blk_read_time AS ts_rtime_before
++  FROM pg_stat_tablespace WHERE tablespace_name = 'regress_tblspace' \gset
++BEGIN;
++ALTER TABLE test_tablespace_stats SET TABLESPACE regress_tblspace;
++SELECT count(*) > 0 FROM test_tablespace_stats;
++ ?column? 
++----------
++ t
++(1 row)
++
++COMMIT;
++SELECT pg_stat_force_next_flush();
++ pg_stat_force_next_flush 
++--------------------------
++ 
++(1 row)
++
++SELECT blks_read > :ts_read_before AS reads_counted,
++       blk_read_time > :ts_rtime_before AS read_time_counted
++  FROM pg_stat_tablespace WHERE tablespace_name = 'regress_tblspace';
++ reads_counted | read_time_counted 
++---------------+-------------------
++ t             | t
++(1 row)
++
++RESET track_io_timing;
++DROP TABLE test_tablespace_stats;
++-- Temporary files are attributed to the tablespace they were created in,
++-- which without temp_tablespaces set is pg_default.
++SELECT temp_files AS ts_tmpf_before, temp_bytes AS ts_tmpb_before
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default' \gset
++SET work_mem = '64kB';
++SELECT count(*) > 0 FROM
++  (SELECT * FROM generate_series(1, 10000) AS s ORDER BY s DESC) AS foo;
++ ?column? 
++----------
++ t
++(1 row)
++
++RESET work_mem;
++SELECT pg_stat_force_next_flush();
++ pg_stat_force_next_flush 
++--------------------------
++ 
++(1 row)
++
++SELECT temp_files > :ts_tmpf_before AS temp_files_counted,
++       temp_bytes > :ts_tmpb_before AS temp_bytes_counted
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default';
++ temp_files_counted | temp_bytes_counted 
++--------------------+--------------------
++ t                  | t
++(1 row)
++
++-- Resetting sets the timestamp, and resetting again does not move it backwards
++SELECT pg_stat_reset_shared('tablespace');
++ pg_stat_reset_shared 
++----------------------
++ 
++(1 row)
++
++SELECT stats_reset AS ts_reset_before FROM pg_stat_tablespace
++  WHERE tablespace_name = 'pg_default' \gset
++SELECT pg_stat_reset_shared('tablespace');
++ pg_stat_reset_shared 
++----------------------
++ 
++(1 row)
++
++SELECT stats_reset >= :'ts_reset_before'::timestamptz FROM pg_stat_tablespace
++  WHERE tablespace_name = 'pg_default';
++ ?column? 
++----------
++ t
++(1 row)
++
+ -- End of Stats Test
+diff --git a/src/test/regress/expected/tablespace.out b/src/test/regress/expected/tablespace.out
+index f0dd25cdf0c..3a8124e937c 100644
+--- a/src/test/regress/expected/tablespace.out
++++ b/src/test/regress/expected/tablespace.out
+@@ -951,6 +951,44 @@ ERROR:  permission denied for tablespace regress_tblspace
+ REINDEX (TABLESPACE regress_tblspace, CONCURRENTLY) TABLE tablespace_table; -- fail
+ ERROR:  permission denied for tablespace regress_tblspace
+ RESET ROLE;
++-- A relation moved to another tablespace must be credited to the new one in
++-- pg_stat_tablespace.  pgstat_info is preserved across a relcache rebuild, so
++-- doing this while the relation is already in use exercises
++-- pgstat_relation_update_tablespace().
++CREATE TABLE tablespace_stats_move (a int);
++INSERT INTO tablespace_stats_move SELECT generate_series(1, 10);
++SELECT pg_stat_force_next_flush();
++ pg_stat_force_next_flush 
++--------------------------
++ 
++(1 row)
++
++SELECT tup_inserted AS stats_move_before FROM pg_stat_tablespace
++  WHERE tablespace_name = 'regress_tblspace' \gset
++BEGIN;
++SELECT count(*) > 0 FROM tablespace_stats_move;
++ ?column? 
++----------
++ t
++(1 row)
++
++ALTER TABLE tablespace_stats_move SET TABLESPACE regress_tblspace;
++INSERT INTO tablespace_stats_move SELECT generate_series(1, 10);
++COMMIT;
++SELECT pg_stat_force_next_flush();
++ pg_stat_force_next_flush 
++--------------------------
++ 
++(1 row)
++
++SELECT tup_inserted > :stats_move_before AS credited_to_new_tablespace
++  FROM pg_stat_tablespace WHERE tablespace_name = 'regress_tblspace';
++ credited_to_new_tablespace 
++----------------------------
++ t
++(1 row)
++
++DROP TABLE tablespace_stats_move;
+ ALTER TABLESPACE regress_tblspace RENAME TO regress_tblspace_renamed;
+ ALTER TABLE ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
+ ALTER INDEX ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
+diff --git a/src/test/regress/sql/stats.sql b/src/test/regress/sql/stats.sql
+index 674637e172b..70ed3dd5139 100644
+--- a/src/test/regress/sql/stats.sql
++++ b/src/test/regress/sql/stats.sql
+@@ -1070,4 +1070,82 @@ SELECT fastpath_exceeded > :backend_fastpath_exceeded_before
+ 
+ DROP TABLE part_test;
+ 
++-- Test pg_stat_tablespace
++-- pg_default and pg_global always exist
++SELECT tablespace_name FROM pg_stat_tablespace
++  WHERE tablespace_name IN ('pg_default', 'pg_global')
++  ORDER BY tablespace_name;
++
++-- Check only that the counters move, not by how much.  pg_stat_tablespace
++-- aggregates every relation in the tablespace and other sessions in this
++-- parallel group are busy in pg_default too, so no exact value is
++-- reproducible.  I/O timings are only collected with track_io_timing on.
++SET track_io_timing = on;
++SELECT tup_inserted AS ts_ins_before,
++       tup_updated AS ts_upd_before,
++       tup_deleted AS ts_del_before,
++       tup_returned AS ts_ret_before,
++       blks_hit AS ts_hit_before,
++       blk_write_time AS ts_wtime_before
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default' \gset
++
++-- Make the table big enough to be extended a number of times, as extending
++-- a relation is what counts as write time here.
++CREATE TABLE test_tablespace_stats (a int);
++INSERT INTO test_tablespace_stats SELECT generate_series(1, 10000);
++UPDATE test_tablespace_stats SET a = a + 1 WHERE a > 5000;
++DELETE FROM test_tablespace_stats WHERE a > 9000;
++SELECT count(*) > 0 FROM test_tablespace_stats;
++SELECT pg_stat_force_next_flush();
++
++SELECT tup_inserted > :ts_ins_before AS inserts_counted,
++       tup_updated > :ts_upd_before AS updates_counted,
++       tup_deleted > :ts_del_before AS deletes_counted,
++       tup_returned > :ts_ret_before AS returns_counted,
++       blks_hit > :ts_hit_before AS hits_counted,
++       blk_write_time > :ts_wtime_before AS write_time_counted
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default';
++
++-- Block reads.  Moving the table to another tablespace rewrites it without
++-- going through shared buffers, so the SELECT has to read it back in, and
++-- those reads belong to the new tablespace.  Do this in a transaction to keep
++-- autovacuum from reading the rewritten table first.
++SELECT blks_read AS ts_read_before, blk_read_time AS ts_rtime_before
++  FROM pg_stat_tablespace WHERE tablespace_name = 'regress_tblspace' \gset
++BEGIN;
++ALTER TABLE test_tablespace_stats SET TABLESPACE regress_tblspace;
++SELECT count(*) > 0 FROM test_tablespace_stats;
++COMMIT;
++SELECT pg_stat_force_next_flush();
++
++SELECT blks_read > :ts_read_before AS reads_counted,
++       blk_read_time > :ts_rtime_before AS read_time_counted
++  FROM pg_stat_tablespace WHERE tablespace_name = 'regress_tblspace';
++RESET track_io_timing;
++
++DROP TABLE test_tablespace_stats;
++
++-- Temporary files are attributed to the tablespace they were created in,
++-- which without temp_tablespaces set is pg_default.
++SELECT temp_files AS ts_tmpf_before, temp_bytes AS ts_tmpb_before
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default' \gset
++
++SET work_mem = '64kB';
++SELECT count(*) > 0 FROM
++  (SELECT * FROM generate_series(1, 10000) AS s ORDER BY s DESC) AS foo;
++RESET work_mem;
++SELECT pg_stat_force_next_flush();
++
++SELECT temp_files > :ts_tmpf_before AS temp_files_counted,
++       temp_bytes > :ts_tmpb_before AS temp_bytes_counted
++  FROM pg_stat_tablespace WHERE tablespace_name = 'pg_default';
++
++-- Resetting sets the timestamp, and resetting again does not move it backwards
++SELECT pg_stat_reset_shared('tablespace');
++SELECT stats_reset AS ts_reset_before FROM pg_stat_tablespace
++  WHERE tablespace_name = 'pg_default' \gset
++SELECT pg_stat_reset_shared('tablespace');
++SELECT stats_reset >= :'ts_reset_before'::timestamptz FROM pg_stat_tablespace
++  WHERE tablespace_name = 'pg_default';
++
+ -- End of Stats Test
+diff --git a/src/test/regress/sql/tablespace.sql b/src/test/regress/sql/tablespace.sql
+index c43a59e5957..e99a39b1aa8 100644
+--- a/src/test/regress/sql/tablespace.sql
++++ b/src/test/regress/sql/tablespace.sql
+@@ -420,6 +420,27 @@ REINDEX (TABLESPACE regress_tblspace) TABLE tablespace_table; -- fail
+ REINDEX (TABLESPACE regress_tblspace, CONCURRENTLY) TABLE tablespace_table; -- fail
+ RESET ROLE;
+ 
++-- A relation moved to another tablespace must be credited to the new one in
++-- pg_stat_tablespace.  pgstat_info is preserved across a relcache rebuild, so
++-- doing this while the relation is already in use exercises
++-- pgstat_relation_update_tablespace().
++CREATE TABLE tablespace_stats_move (a int);
++INSERT INTO tablespace_stats_move SELECT generate_series(1, 10);
++SELECT pg_stat_force_next_flush();
++SELECT tup_inserted AS stats_move_before FROM pg_stat_tablespace
++  WHERE tablespace_name = 'regress_tblspace' \gset
++
++BEGIN;
++SELECT count(*) > 0 FROM tablespace_stats_move;
++ALTER TABLE tablespace_stats_move SET TABLESPACE regress_tblspace;
++INSERT INTO tablespace_stats_move SELECT generate_series(1, 10);
++COMMIT;
++SELECT pg_stat_force_next_flush();
++
++SELECT tup_inserted > :stats_move_before AS credited_to_new_tablespace
++  FROM pg_stat_tablespace WHERE tablespace_name = 'regress_tblspace';
++DROP TABLE tablespace_stats_move;
++
+ ALTER TABLESPACE regress_tblspace RENAME TO regress_tblspace_renamed;
+ 
+ ALTER TABLE ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default;
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index 5d432074c2c..7252937e1a5 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -2307,6 +2307,7 @@ PgStatShared_Relation
+ PgStatShared_ReplSlot
+ PgStatShared_SLRU
+ PgStatShared_Subscription
++PgStatShared_Tablespace
+ PgStatShared_Wal
+ PgStat_ArchiverStats
+ PgStat_Backend
+@@ -2331,6 +2332,7 @@ PgStat_LockEntry
+ PgStat_PendingDroppedStatsItem
+ PgStat_PendingIO
+ PgStat_PendingLock
++PgStat_PendingTabspaceTime
+ PgStat_RelationStatus
+ PgStat_SLRUStats
+ PgStat_ShmemControl
+@@ -2344,6 +2346,7 @@ PgStat_StatIdxEntry
+ PgStat_StatReplSlotEntry
+ PgStat_StatSubEntry
+ PgStat_StatTabEntry
++PgStat_StatTabspaceEntry
+ PgStat_StatsFileOp
+ PgStat_SubXactStatus
+ PgStat_TableCounts
+-- 
+2.37.1 (Apple Git-137.1)
+

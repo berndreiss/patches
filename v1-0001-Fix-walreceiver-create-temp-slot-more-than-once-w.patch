@@ -1,0 +1,64 @@
+From b50c78fc239d76ee934b761d6c2c71c9f8cfd491 Mon Sep 17 00:00:00 2001
+From: ChangAo Chen <cca5507@qq.com>
+Date: Sat, 22 Aug 2026 22:40:46 +0800
+Subject: [PATCH v1] Fix walreceiver create temp slot more than once when
+ timeline switch.
+
+---
+ src/backend/replication/walreceiver.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/replication/walreceiver.c b/src/backend/replication/walreceiver.c
+index 61dc6a5588b..e7e5bcdedb7 100644
+--- a/src/backend/replication/walreceiver.c
++++ b/src/backend/replication/walreceiver.c
+@@ -157,7 +157,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
+ 	char		conninfo[MAXCONNINFO];
+ 	char	   *tmp_conninfo;
+ 	char		slotname[NAMEDATALEN];
+-	bool		is_temp_slot;
++	bool		create_temp_slot;
+ 	XLogRecPtr	startpoint;
+ 	TimeLineID	startpointTLI;
+ 	TimeLineID	primaryTLI;
+@@ -225,15 +225,15 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
+ 	walrcv->ready_to_display = false;
+ 	strlcpy(conninfo, walrcv->conninfo, MAXCONNINFO);
+ 	strlcpy(slotname, walrcv->slotname, NAMEDATALEN);
+-	is_temp_slot = walrcv->is_temp_slot;
++	create_temp_slot = walrcv->is_temp_slot;
+ 	startpoint = walrcv->receiveStart;
+ 	startpointTLI = walrcv->receiveStartTLI;
+ 
+ 	/*
+-	 * At most one of is_temp_slot and slotname can be set; otherwise,
++	 * At most one of create_temp_slot and slotname can be set; otherwise,
+ 	 * RequestXLogStreaming messed up.
+ 	 */
+-	Assert(!is_temp_slot || (slotname[0] == '\0'));
++	Assert(!create_temp_slot || (slotname[0] == '\0'));
+ 
+ 	/* Initialise to a sanish value */
+ 	now = GetCurrentTimestamp();
+@@ -435,7 +435,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
+ 		 * name in shared memory.  (Note the slot name cannot already be set
+ 		 * in this case.)
+ 		 */
+-		if (is_temp_slot)
++		if (create_temp_slot)
+ 		{
+ 			snprintf(slotname, sizeof(slotname),
+ 					 "pg_walreceiver_%lld",
+@@ -443,6 +443,9 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
+ 
+ 			walrcv_create_slot(wrconn, slotname, true, false, false, 0, NULL);
+ 
++			/* Only create once */
++			create_temp_slot = false;
++
+ 			SpinLockAcquire(&walrcv->mutex);
+ 			strlcpy(walrcv->slotname, slotname, NAMEDATALEN);
+ 			SpinLockRelease(&walrcv->mutex);
+-- 
+2.34.1
+
