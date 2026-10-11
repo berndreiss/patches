@@ -1,0 +1,68 @@
+SCALE=100 TX=2000 RUNS=5 CPUS=2,3
+run  1  pgsql-patched        instr/tx   758778.7  cycles/tx   952911.7
+run  1  pgsql                instr/tx   759053.1  cycles/tx  1249243.7
+run  2  pgsql                instr/tx   759805.6  cycles/tx  1253902.1
+run  2  pgsql-patched        instr/tx   758998.0  cycles/tx  1248519.3
+run  3  pgsql-patched        instr/tx   758448.4  cycles/tx  1252301.4
+run  3  pgsql                instr/tx   758779.3  cycles/tx  1243066.0
+run  4  pgsql                instr/tx   760104.0  cycles/tx  1252620.8
+run  4  pgsql-patched        instr/tx   759052.3  cycles/tx  1248372.3
+run  5  pgsql-patched        instr/tx   758821.2  cycles/tx  1248133.1
+run  5  pgsql                instr/tx   758283.0  cycles/tx  1249411.8
+
+== per tx: median (min .. max) over 5 runs ==
+pgsql-patched        instr   758821.0 (758448.0 .. 759052.0)   cycles  1248370.0 (952912.0 .. 1252300.0)
+pgsql                instr   759053.0 (758283.0 .. 760104.0)   cycles  1249410.0 (1243070.0 .. 1253900.0)
+pgsql vs pgsql-patched: instr +232.0/tx (+0.031%), cycles +1040.0/tx (+0.08%)
+raw results: /var/lib/postgresql/perf-results-20261011-125856.csv
+SCALE=100 TX=5000 RUNS=5 CPUS=2,3
+run  1  pgsql-patched        instr/tx   742015.6  cycles/tx  1234716.3
+run  1  pgsql                instr/tx   742862.1  cycles/tx  1232390.5
+run  2  pgsql                instr/tx   742708.8  cycles/tx  1231701.4
+run  2  pgsql-patched        instr/tx   742175.8  cycles/tx  1233750.9
+run  3  pgsql-patched        instr/tx   742971.9  cycles/tx  1228167.0
+run  3  pgsql                instr/tx   742418.5  cycles/tx  1228426.8
+run  4  pgsql                instr/tx   742958.5  cycles/tx  1234535.2
+run  4  pgsql-patched        instr/tx   742175.8  cycles/tx  1234877.0
+run  5  pgsql-patched        instr/tx   741594.8  cycles/tx  1234237.3
+run  5  pgsql                instr/tx   742476.8  cycles/tx  1232417.0
+
+== per tx: median (min .. max) over 5 runs ==
+pgsql-patched        instr   742176.0 (741595.0 .. 742972.0)   cycles  1234240.0 (1228170.0 .. 1234880.0)
+pgsql                instr   742709.0 (742419.0 .. 742958.0)   cycles  1232390.0 (1228430.0 .. 1234540.0)
+pgsql vs pgsql-patched: instr +533.0/tx (+0.072%), cycles -1850.0/tx (-0.15%)
+raw results: /var/lib/postgresql/perf-results-20261011-130314.csv
+SCALE=100 TX=10000 RUNS=5 CPUS=2,3
+run  1  pgsql-patched        instr/tx   732280.0  cycles/tx  1221578.1
+run  1  pgsql                instr/tx   732930.8  cycles/tx  1217334.8
+run  2  pgsql                instr/tx   732793.6  cycles/tx  1220028.1
+run  2  pgsql-patched        instr/tx   732568.4  cycles/tx  1212818.0
+run  3  pgsql-patched        instr/tx   732659.6  cycles/tx  1218200.7
+run  3  pgsql                instr/tx   733174.7  cycles/tx  1218608.5
+run  4  pgsql                instr/tx   733152.5  cycles/tx  1221470.5
+run  4  pgsql-patched        instr/tx   732351.2  cycles/tx  1218003.7
+run  5  pgsql-patched        instr/tx   732208.4  cycles/tx  1216250.4
+run  5  pgsql                instr/tx   732576.8  cycles/tx  1219279.3
+
+== per tx: median (min .. max) over 5 runs ==
+pgsql-patched        instr   732351.0 (732208.0 .. 732660.0)   cycles  1218000.0 (1212820.0 .. 1221580.0)
+pgsql                instr   732931.0 (732577.0 .. 733175.0)   cycles  1219280.0 (1217330.0 .. 1221470.0)
+pgsql vs pgsql-patched: instr +580.0/tx (+0.079%), cycles +1280.0/tx (+0.11%)
+raw results: /var/lib/postgresql/perf-results-20261011-130942.csv
+SCALE=100 TX=20000 RUNS=5 CPUS=2,3
+run  1  pgsql-patched        instr/tx   726543.2  cycles/tx  1212314.1
+run  1  pgsql                instr/tx   727100.5  cycles/tx  1217212.7
+run  2  pgsql                instr/tx   727190.4  cycles/tx  1214008.8
+run  2  pgsql-patched        instr/tx   726760.4  cycles/tx  1175233.0
+run  3  pgsql-patched        instr/tx   726664.6  cycles/tx  1180359.1
+run  3  pgsql                instr/tx   727192.8  cycles/tx  1183244.5
+run  4  pgsql                instr/tx   727201.4  cycles/tx  1185885.3
+run  4  pgsql-patched        instr/tx   726405.0  cycles/tx  1179761.2
+run  5  pgsql-patched        instr/tx   726490.5  cycles/tx  1185351.9
+run  5  pgsql                instr/tx   726904.1  cycles/tx  1185802.9
+
+== per tx: median (min .. max) over 5 runs ==
+pgsql-patched        instr   726543.0 (726405.0 .. 726760.0)   cycles  1180360.0 (1175230.0 .. 1212310.0)
+pgsql                instr   727190.0 (726904.0 .. 727201.0)   cycles  1185890.0 (1183240.0 .. 1217210.0)
+pgsql vs pgsql-patched: instr +647.0/tx (+0.089%), cycles +5530.0/tx (+0.47%)
+raw results: /var/lib/postgresql/perf-results-20261011-131933.csv

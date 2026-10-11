@@ -1,0 +1,12 @@
+2026-10-11 13:26:26.642 CEST [28974] LOG:  starting PostgreSQL 20devel on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-10-11 13:26:26.642 CEST [28974] LOG:  listening on IPv4 address "127.0.0.1", port 5499
+2026-10-11 13:26:26.655 CEST [28974] LOG:  listening on Unix socket "/tmp/.s.PGSQL.5499"
+2026-10-11 13:26:26.669 CEST [28979] LOG:  database system was shut down at 2026-10-11 13:26:26 CEST
+2026-10-11 13:26:26.677 CEST [28974] LOG:  database system is ready to accept connections
+2026-10-11 13:27:42.827 CEST [28974] LOG:  received fast shutdown request
+2026-10-11 13:27:42.834 CEST [28974] LOG:  aborting any active transactions
+2026-10-11 13:27:42.834 CEST [28974] LOG:  background worker "logical replication launcher" (PID 28981) exited with exit code 1
+2026-10-11 13:27:42.834 CEST [28977] LOG:  shutting down
+2026-10-11 13:27:42.841 CEST [28977] LOG:  checkpoint starting: shutdown fast
+2026-10-11 13:27:43.245 CEST [28977] LOG:  checkpoint complete: shutdown fast: wrote 10 buffers (62.5%), wrote 13 SLRU buffers; 0 WAL file(s) added, 17 removed, 0 recycled; write=0.013 s, sync=0.234 s, total=0.411 s; sync files=21, longest=0.127 s, average=0.012 s; distance=264647 kB, estimate=264647 kB; lsn=0/5E1DD758, redo lsn=0/5E1DD758
+2026-10-11 13:27:43.262 CEST [28974] LOG:  database system is shut down

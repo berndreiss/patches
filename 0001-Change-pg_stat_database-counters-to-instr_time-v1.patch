@@ -1,0 +1,153 @@
+From 6b41d8ee159d70ce5ff9558a83539b404f1b02e8 Mon Sep 17 00:00:00 2001
+From: berndreiss <bd_reiss@gmx.at>
+Date: Thu, 24 Sep 2026 19:12:02 +0200
+Subject: [PATCH] Change pg_stat_database counters to instr_time v1
+
+---
+ src/backend/access/heap/vacuumlazy.c         |  8 ++++----
+ src/backend/commands/analyze.c               |  8 ++++----
+ src/backend/utils/activity/pgstat_database.c | 12 ++++++------
+ src/backend/utils/activity/pgstat_io.c       |  4 ++--
+ src/include/pgstat.h                         |  8 ++------
+ 5 files changed, 18 insertions(+), 22 deletions(-)
+
+diff --git a/src/backend/access/heap/vacuumlazy.c b/src/backend/access/heap/vacuumlazy.c
+index 8e1f660..f1dbe12 100644
+--- a/src/backend/access/heap/vacuumlazy.c
++++ b/src/backend/access/heap/vacuumlazy.c
+@@ -652,8 +652,8 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
+ 		pg_rusage_init(&ru0);
+ 		if (track_io_timing)
+ 		{
+-			startreadtime = pgStatBlockReadTime;
+-			startwritetime = pgStatBlockWriteTime;
++			startreadtime = INSTR_TIME_GET_MICROSEC(pgStatBlockReadTime);
++			startwritetime = INSTR_TIME_GET_MICROSEC(pgStatBlockWriteTime);
+ 		}
+ 	}
+ 
+@@ -1176,8 +1176,8 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
+ 			}
+ 			if (track_io_timing)
+ 			{
+-				double		read_ms = (double) (pgStatBlockReadTime - startreadtime) / 1000;
+-				double		write_ms = (double) (pgStatBlockWriteTime - startwritetime) / 1000;
++				double		read_ms = (double) (INSTR_TIME_GET_MICROSEC(pgStatBlockReadTime) - startreadtime) / 1000;
++				double		write_ms = (double) (INSTR_TIME_GET_MICROSEC(pgStatBlockWriteTime) - startwritetime) / 1000;
+ 
+ 				appendStringInfo(&buf, _("I/O timings: read: %.3f ms, write: %.3f ms\n"),
+ 								 read_ms, write_ms);
+diff --git a/src/backend/commands/analyze.c b/src/backend/commands/analyze.c
+index c05f9f5..0c34c92 100644
+--- a/src/backend/commands/analyze.c
++++ b/src/backend/commands/analyze.c
+@@ -380,8 +380,8 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
+ 	{
+ 		if (track_io_timing)
+ 		{
+-			startreadtime = pgStatBlockReadTime;
+-			startwritetime = pgStatBlockWriteTime;
++			startreadtime = INSTR_TIME_GET_MICROSEC(pgStatBlockReadTime);
++			startwritetime = INSTR_TIME_GET_MICROSEC(pgStatBlockWriteTime);
+ 		}
+ 
+ 		pg_rusage_init(&ru0);
+@@ -829,8 +829,8 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
+ 			}
+ 			if (track_io_timing)
+ 			{
+-				double		read_ms = (double) (pgStatBlockReadTime - startreadtime) / 1000;
+-				double		write_ms = (double) (pgStatBlockWriteTime - startwritetime) / 1000;
++				double		read_ms = (double) (INSTR_TIME_GET_MICROSEC(pgStatBlockReadTime) - startreadtime) / 1000;
++				double		write_ms = (double) (INSTR_TIME_GET_MICROSEC(pgStatBlockWriteTime) - startwritetime) / 1000;
+ 
+ 				appendStringInfo(&buf, _("I/O timings: read: %.3f ms, write: %.3f ms\n"),
+ 								 read_ms, write_ms);
+diff --git a/src/backend/utils/activity/pgstat_database.c b/src/backend/utils/activity/pgstat_database.c
+index 7f3bc01..d95eae0 100644
+--- a/src/backend/utils/activity/pgstat_database.c
++++ b/src/backend/utils/activity/pgstat_database.c
+@@ -25,8 +25,8 @@
+ static bool pgstat_should_report_connstat(void);
+ 
+ 
+-PgStat_Counter pgStatBlockReadTime = 0;
+-PgStat_Counter pgStatBlockWriteTime = 0;
++instr_time pgStatBlockReadTime;
++instr_time pgStatBlockWriteTime;
+ PgStat_Counter pgStatActiveTime = 0;
+ PgStat_Counter pgStatTransactionIdleTime = 0;
+ SessionEndType pgStatSessionEndCause = DISCONNECT_NORMAL;
+@@ -349,8 +349,8 @@ pgstat_update_dbstats(TimestampTz ts)
+ 	 */
+ 	dbentry->xact_commit += pgStatXactCommit;
+ 	dbentry->xact_rollback += pgStatXactRollback;
+-	dbentry->blk_read_time += pgStatBlockReadTime;
+-	dbentry->blk_write_time += pgStatBlockWriteTime;
++	dbentry->blk_read_time += INSTR_TIME_GET_MICROSEC(pgStatBlockReadTime);
++	dbentry->blk_write_time += INSTR_TIME_GET_MICROSEC(pgStatBlockWriteTime);
+ 
+ 	if (pgstat_should_report_connstat())
+ 	{
+@@ -370,8 +370,8 @@ pgstat_update_dbstats(TimestampTz ts)
+ 
+ 	pgStatXactCommit = 0;
+ 	pgStatXactRollback = 0;
+-	pgStatBlockReadTime = 0;
+-	pgStatBlockWriteTime = 0;
++	INSTR_TIME_SET_ZERO(pgStatBlockReadTime);
++	INSTR_TIME_SET_ZERO(pgStatBlockWriteTime);
+ 	pgStatActiveTime = 0;
+ 	pgStatTransactionIdleTime = 0;
+ }
+diff --git a/src/backend/utils/activity/pgstat_io.c b/src/backend/utils/activity/pgstat_io.c
+index 8ec1aad..c81ae55 100644
+--- a/src/backend/utils/activity/pgstat_io.c
++++ b/src/backend/utils/activity/pgstat_io.c
+@@ -125,7 +125,7 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
+ 		{
+ 			if (io_op == IOOP_WRITE || io_op == IOOP_EXTEND)
+ 			{
+-				pgstat_count_buffer_write_time(INSTR_TIME_GET_MICROSEC(io_time));
++				INSTR_TIME_ADD(pgStatBlockWriteTime, io_time);
+ 				if (io_object == IOOBJECT_RELATION)
+ 					INSTR_TIME_ADD(pgBufferUsage.shared_blk_write_time, io_time);
+ 				else if (io_object == IOOBJECT_TEMP_RELATION)
+@@ -133,7 +133,7 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
+ 			}
+ 			else if (io_op == IOOP_READ)
+ 			{
+-				pgstat_count_buffer_read_time(INSTR_TIME_GET_MICROSEC(io_time));
++				INSTR_TIME_ADD(pgStatBlockReadTime, io_time);
+ 				if (io_object == IOOBJECT_RELATION)
+ 					INSTR_TIME_ADD(pgBufferUsage.shared_blk_read_time, io_time);
+ 				else if (io_object == IOOBJECT_TEMP_RELATION)
+diff --git a/src/include/pgstat.h b/src/include/pgstat.h
+index 187d82c..36441e9 100644
+--- a/src/include/pgstat.h
++++ b/src/include/pgstat.h
+@@ -739,10 +739,6 @@ extern void pgstat_report_connect(Oid dboid);
+ extern void pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
+ 												 PgStat_Counter workers_launched);
+ 
+-#define pgstat_count_buffer_read_time(n)							\
+-	(pgStatBlockReadTime += (n))
+-#define pgstat_count_buffer_write_time(n)							\
+-	(pgStatBlockWriteTime += (n))
+ #define pgstat_count_conn_active_time(n)							\
+ 	(pgStatActiveTime += (n))
+ #define pgstat_count_conn_txn_idle_time(n)							\
+@@ -982,8 +978,8 @@ extern PGDLLIMPORT PgStat_CheckpointerStats PendingCheckpointerStats;
+  */
+ 
+ /* Updated by pgstat_count_buffer_*_time macros */
+-extern PGDLLIMPORT PgStat_Counter pgStatBlockReadTime;
+-extern PGDLLIMPORT PgStat_Counter pgStatBlockWriteTime;
++extern PGDLLIMPORT instr_time pgStatBlockReadTime;
++extern PGDLLIMPORT instr_time pgStatBlockWriteTime;
+ 
+ /*
+  * Updated by pgstat_count_conn_*_time macros, called by
+-- 
+2.43.0
+

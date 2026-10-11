@@ -1,0 +1,22 @@
+Hi Shihao, hi Andres,
+
+Ahmed Gouda and I have been looking at the patch more closely and we would like to mention the following points:
+
+1) We agree with Andres Freund [1] that the implementation of pg_stat_tablespace should primarily make use of existing infrastructure. Calling pgstat_count_tablespace_io_op_time from within pgstat_count_io_op_time makes counting more centralized and, therefore, consolidates the code base. We are not sure, however, that creating a wrapper around the extended function is the best idea: it might hide from callers the fact that pgstat_count_io_op_time collects tablespace statistics, and as a result, tablespace statistic counts might be missed when the wrong function is used. Keeping only the original function and extending the signature makes the caller think about the tablespace OID every time the function is used, which might be better.
+
+2) We would like to suggest changing the data type of the time counters from PgStat_Counter to instr_time. In patch [2] Ahmed and I looked into time skew between pg_stat_database and pg_stat_io, due to pg_stat_database truncating the timing count to microseconds on every increment of the counter. The same problem exists in this patch, as it follows the implementation of pg_stat_database closely. Accumulating the timings in instr_time preserves tick-level precision and leads to more accurate totals overall. Since we got some positive feedback on this approach, we wanted to bring this to your attention. 
+
+3) We would like to question whether the view really needs statistics about tuples. In the end this is a view about access to the disk where a tablespace lives. The tuple counts are a very database-specific metric and we don't really see the merit in including them. Meanwhile, the other statistics are very useful for detecting disk-specific bottlenecks and provide real value from a DBA's perspective.
+
+Some minor points:
+
+  - The comments on the functions in backend/utils/activity/pgstat_xact.c used by the patch should also mention tablespaces
+  - The columns 'tablespace_name' and 'tablespace_id' don't follow established naming patterns. We think 'spcname' and 'spcid', respectively, would be a better fit.
+  - "* - pgstat_tablespace.c" is missing from the header in pgstat.c
+
+Best regards,
+Ahmed and Bernd
+
+
+[1] https://www.postgresql.org/message-id/qihwj3bbzazlcq4uxy3nfdnsekbdbbccsccmqyhv2q37oyl4t4%40f4jx4inuv2az1
+[2] https://www.postgresql.org/message-id/605732d2-c6bd-4c65-ac83-8d071935d860@gmx.at

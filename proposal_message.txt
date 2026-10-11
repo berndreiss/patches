@@ -1,0 +1,126 @@
+Dear hackers,
+
+While working on a review for another patch (see [1]) Ahmed Gouda and I noticed time skew in write and read times between the pg_stat_database and pg_stat_io views.
+
+Running the following script on a test server with a single database and track_io_timing=on illustrates the difference:
+
+drop table if exists test; create table test (id bigint);
+create or replace view stat_comparison as select
+    'pg_stat_database' as source,
+    round(sum(blk_write_time)::numeric,3) ms_write,
+    round(sum(blk_read_time)::numeric, 3) ms_read
+from
+    pg_stat_database
+union all
+select
+    'pg_stat_io',
+    round(sum(coalesce(write_time,0) + coalesce(extend_time, 0))::numeric, 3),
+    round(sum(coalesce(read_time,0))::numeric, 3)
+from
+    pg_stat_io
+where
+    backend_type not in ('checkpointer', 'background writer', 'autovacuum launcher') and object in ('relation', 'temp relation');
+-- reset the numbers twice to make sure all stats are set to 0
+select pg_stat_reset();select pg_stat_reset_shared();
+\c template1
+select pg_stat_reset();select pg_stat_reset_shared();
+\c postgres
+select pg_stat_reset();select pg_stat_reset_shared();
+\c template1
+select pg_stat_reset();select pg_stat_reset_shared();
+\c postgres
+select * from stat_comparison; 
+insert into test select generate_series(1,1e8);
+select count(id) from test;
+checkpoint; -- write dirty buffers to make the script reproducible
+select pg_sleep(3);
+select * from stat_comparison;
+DROP TABLE
+CREATE TABLE
+CREATE VIEW
+ pg_stat_reset 
+---------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+You are now connected to database "template1" as user "postgres".
+ pg_stat_reset 
+---------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+You are now connected to database "postgres" as user "postgres".
+ pg_stat_reset 
+---------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+You are now connected to database "template1" as user "postgres".
+ pg_stat_reset 
+---------------
+ 
+(1 row)
+
+ pg_stat_reset_shared 
+----------------------
+ 
+(1 row)
+
+You are now connected to database "postgres" as user "postgres".
+      source      | ms_write | ms_read 
+------------------+----------+---------
+ pg_stat_database |    0.000 |   0.000
+ pg_stat_io       |    0.000 |   0.000
+(2 rows)
+
+INSERT 0 100000000
+   count   
+-----------
+ 100000000
+(1 row)
+
+CHECKPOINT
+ pg_sleep 
+----------
+ 
+(1 row)
+
+      source      | ms_write | ms_read  
+------------------+----------+----------
+ pg_stat_database | 4279.430 | 1354.911
+ pg_stat_io       | 4899.788 | 1381.406
+(2 rows)
+
+Inspecting pgstat_count_io_op_time() in pgstat_io.c, we found that for pg_stat_database the io_time is first truncated to microseconds before being added to the pgStatBlockReadTime and pgStatBlockWriteTime counters using pgstat_count_buffer_{write|read}_time(INSTR_TIME_GET_MICROSEC(io_time)), while for pg_stat_io the timing is added to a native instr_time counter using ticks directly. The truncation to microseconds happens only at flush time, making the count more precise.
+
+Therefore, we propose changing the data type of the pg_stat_database counters from PgStat_Counter to instr_time. PFA a patch with the implementation. We decided to remove the pgstat_count_buffer_{write|read}_time macros since pgstat_count_io_op_time() was their only call site and they have therefore become obsolete. We also changed the data type of the local variables startreadtime and startwritetime to instr_time in heap_vacuum_rel() (vacuumlazy.c) and do_analyze_rel() (analyze.c), since they hold snapshots of pgStatBlockReadTime and pgStatBlockWriteTime. This makes the code style more consistent, and the elapsed time is converted directly from instr_time to milliseconds without first truncating it to microseconds.
+ 
+With the patch applied, the gap almost vanishes (separate run, so the absolute numbers differ):
+
+      source      | ms_write | ms_read 
+------------------+----------+---------
+ pg_stat_database | 4976.780 |  35.190
+ pg_stat_io       | 4976.777 |  35.187
+(2 rows)
+
+We attribute the remaining difference to pg_stat_io truncating the time for every object while pg_stat_database truncates them as a sum (therefore cutting off less).
+
+Best regards,
+Ahmed Gouda and Bernd Reiß
+
+[1] https://www.postgresql.org/message-id/CAGRkXqRHsZw3+aeNZgnBYduQSY7qg1O4MBdmyFjK-A+TU1-b-A@mail.gmail.com
