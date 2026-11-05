@@ -1,0 +1,453 @@
+From ec7fc89490a8fd9861b44168063a8de7c85f57ba Mon Sep 17 00:00:00 2001
+From: Anthonin Bonnefoy <anthonin.bonnefoy@datadoghq.com>
+Date: Tue, 23 Jun 2026 11:05:33 +0200
+Subject: Adjust row estimation and index selectivity with unique index
+
+Currently, matching a unique index in btcostestimate only adjusts
+numIndexTuples to 1. This is fine for single column indexes as the
+initial row estimation does check if there's a matching unique index,
+and adjust the selectivity accordingly.
+
+However, for multi-column unique indexes, the planner doesn't have such
+information, and genericcostestimate will go through the normal process
+of combining the selectivity of each column.
+
+This can lead to a row estimation > 1 despite the unique index, and
+possibly avoiding using this unique index due to the higher cost.
+
+To fix this, this patch introduces the notion of "unique path": A unique
+index with at least one equality operation on all key columns. When this
+condition is met, we can assume that this path will yield at most one
+row, and adjust path->rows, numIndexTuples and index selectivity
+accordingly.
+
+This logic was partially implemented in btcostestimate, is now extracted
+in is_path_unique and called when index paths are built. There are some
+minor changes done:
+
+- IS NULL is accepted as a valid equal operation if NULLS NOT DISTINCT
+  is set
+- Finding an array doesn't invalidate uniqueness. "a=1 AND
+  a=ANY('{1,2,3}')" is considered valid for a unique path
+
+This new unique_path property is stored in IndexPath and used in:
+- cost_index to set path's row to 1
+- genericcostestimate to adjust selectivity to 1.0/reltuples
+- btcostestimate, replacing the previous conditions to set
+  numIndexTuples = 1.0
+---
+ src/backend/optimizer/path/costsize.c     |  5 +-
+ src/backend/optimizer/path/indxpath.c     | 97 +++++++++++++++++++++--
+ src/backend/optimizer/plan/planner.c      |  2 +-
+ src/backend/optimizer/util/pathnode.c     |  5 +-
+ src/backend/utils/adt/selfuncs.c          | 37 ++++-----
+ src/include/nodes/pathnodes.h             |  1 +
+ src/include/optimizer/pathnode.h          |  3 +-
+ src/test/regress/expected/planner_est.out | 30 +++----
+ 8 files changed, 134 insertions(+), 46 deletions(-)
+
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 1c575e56ff6..485b2c496e7 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -594,7 +594,10 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
+ 	}
+ 	else
+ 	{
+-		path->path.rows = baserel->rows;
++		if (path->unique_path)
++			path->path.rows = 1.0;
++		else
++			path->path.rows = baserel->rows;
+ 		/* qpquals come from just the rel's restriction clauses */
+ 		qpquals = extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
+ 											  path->indexclauses);
+diff --git a/src/backend/optimizer/path/indxpath.c b/src/backend/optimizer/path/indxpath.c
+index 3f5d4fa3182..e18432bf77a 100644
+--- a/src/backend/optimizer/path/indxpath.c
++++ b/src/backend/optimizer/path/indxpath.c
+@@ -196,7 +196,7 @@ static Expr *match_clause_to_ordering_op(IndexOptInfo *index,
+ static bool ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
+ 									   EquivalenceClass *ec, EquivalenceMember *em,
+ 									   void *arg);
+-
++static bool is_path_unique(IndexOptInfo *index, IndexClauseSet *clauses);
+ 
+ /*
+  * create_index_paths()
+@@ -771,6 +771,82 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 	}
+ }
+ 
++/*
++ * index_clauses_has_eq_op
++ *	  Returns true if the provided index clauses have at least one equality
++ *	  operation
++ */
++static bool
++index_clauses_has_eq_op(IndexOptInfo *index, List *clauses)
++{
++	ListCell   *lc;
++
++	foreach(lc, clauses)
++	{
++		IndexClause *iclause = lfirst_node(IndexClause, lc);
++		ListCell   *lc2;
++
++		foreach(lc2, iclause->indexquals)
++		{
++			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
++			Expr	   *clause = rinfo->clause;
++
++			if (IsA(clause, OpExpr))
++			{
++				int			op_strategy;
++				OpExpr	   *op = (OpExpr *) clause;
++
++				op_strategy = get_op_opfamily_strategy(op->opno,
++													   index->opfamily[iclause->indexcol]);
++				Assert(op_strategy != 0);	/* not a member of opfamily?? */
++				if (op_strategy == BTEqualStrategyNumber)
++					return true;
++			}
++			else if (IsA(clause, NullTest))
++			{
++				NullTest   *nt = (NullTest *) clause;
++
++				if (nt->nulltesttype == IS_NULL && index->nullsnotdistinct)
++				{
++					/*
++					 * IS NULL is like = for uniqueness purposes, but only if
++					 * the index is configured with NULLS NOT DISTINCT
++					 */
++					return true;
++				}
++			}
++		}
++	}
++	return false;
++}
++
++/*
++ * is_path_unique
++ *	  Given an index and its clauses, return true if an index is unique, and
++ *	  all index key columns have at least one equality condition.
++ */
++static bool
++is_path_unique(IndexOptInfo *index, IndexClauseSet *clauses)
++{
++	int			indexcol;
++
++	if (!index->unique)
++		/* Not a unique index, bail out */
++		return false;
++
++	/*
++	 * We have a unique index, check that each key column has at least one
++	 * equality operation
++	 */
++	for (indexcol = 0; indexcol < index->nkeycolumns; indexcol++)
++	{
++		if (!index_clauses_has_eq_op(index, clauses->indexclauses[indexcol]))
++			/* index column doesn't have an eq op, the path can't be unique */
++			return false;
++	}
++	return true;
++}
++
+ /*
+  * build_index_paths
+  *	  Given an index and a set of index clauses for it, construct zero
+@@ -824,6 +900,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 	bool		pathkeys_possibly_useful;
+ 	bool		index_is_ordered;
+ 	bool		index_only_scan;
++	bool		unique_path;
+ 	int			indexcol;
+ 
+ 	Assert(skip_nonnative_saop != NULL || scantype == ST_BITMAPSCAN);
+@@ -901,6 +978,12 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 			return NIL;
+ 	}
+ 
++	/*
++	 * Determine whether the path is unique, i.e., the index is unique and all
++	 * key columns have an equality clause
++	 */
++	unique_path = is_path_unique(index, clauses);
++
+ 	/* We do not want the index's rel itself listed in outer_relids */
+ 	outer_relids = bms_del_member(outer_relids, rel->relid);
+ 
+@@ -974,7 +1057,8 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 								  index_only_scan,
+ 								  outer_relids,
+ 								  loop_count,
+-								  false);
++								  false,
++								  unique_path);
+ 		result = lappend(result, ipath);
+ 
+ 		/*
+@@ -994,7 +1078,8 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 									  index_only_scan,
+ 									  outer_relids,
+ 									  loop_count,
+-									  true);
++									  true,
++									  unique_path);
+ 
+ 			/*
+ 			 * if, after costing the path, we find that it's not worth using
+@@ -1027,7 +1112,8 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 									  index_only_scan,
+ 									  outer_relids,
+ 									  loop_count,
+-									  false);
++									  false,
++									  unique_path);
+ 			result = lappend(result, ipath);
+ 
+ 			/* If appropriate, consider parallel index scan */
+@@ -1044,7 +1130,8 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
+ 										  index_only_scan,
+ 										  outer_relids,
+ 										  loop_count,
+-										  true);
++										  true,
++										  unique_path);
+ 
+ 				/*
+ 				 * if, after costing the path, we find that it's not worth
+diff --git a/src/backend/optimizer/plan/planner.c b/src/backend/optimizer/plan/planner.c
+index 846bd7c1fbe..e4cf1c4f4b2 100644
+--- a/src/backend/optimizer/plan/planner.c
++++ b/src/backend/optimizer/plan/planner.c
+@@ -7269,7 +7269,7 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
+ 	indexScanPath = create_index_path(root, indexInfo,
+ 									  NIL, NIL, NIL, NIL,
+ 									  ForwardScanDirection, false,
+-									  NULL, 1.0, false);
++									  NULL, 1.0, false, false);
+ 
+ 	return (seqScanAndSortPath.total_cost < indexScanPath->path.total_cost);
+ }
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index 73518c8f870..6823ef6bea9 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -1085,6 +1085,7 @@ create_samplescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer
+  * 'loop_count' is the number of repetitions of the indexscan to factor into
+  *		estimates of caching behavior.
+  * 'partial_path' is true if constructing a parallel index scan path.
++ * 'unique_path' is true if path returns at most one row.
+  *
+  * Returns the new path node.
+  */
+@@ -1099,7 +1100,8 @@ create_index_path(PlannerInfo *root,
+ 				  bool indexonly,
+ 				  Relids required_outer,
+ 				  double loop_count,
+-				  bool partial_path)
++				  bool partial_path,
++				  bool unique_path)
+ {
+ 	IndexPath  *pathnode = makeNode(IndexPath);
+ 	RelOptInfo *rel = index->rel;
+@@ -1119,6 +1121,7 @@ create_index_path(PlannerInfo *root,
+ 	pathnode->indexorderbys = indexorderbys;
+ 	pathnode->indexorderbycols = indexorderbycols;
+ 	pathnode->indexscandir = indexscandir;
++	pathnode->unique_path = unique_path;
+ 
+ 	cost_index(pathnode, root, loop_count, partial_path);
+ 
+diff --git a/src/backend/utils/adt/selfuncs.c b/src/backend/utils/adt/selfuncs.c
+index cbc70fde716..e5addb586f4 100644
+--- a/src/backend/utils/adt/selfuncs.c
++++ b/src/backend/utils/adt/selfuncs.c
+@@ -7471,11 +7471,18 @@ genericcostestimate(PlannerInfo *root,
+ 		}
+ 	}
+ 
+-	/* Estimate the fraction of main-table tuples that will be visited */
+-	indexSelectivity = clauselist_selectivity(root, selectivityQuals,
+-											  index->rel->relid,
+-											  JOIN_INNER,
+-											  NULL);
++	if (path->unique_path && index->rel->tuples >= 1.0)
++	{
++		indexSelectivity = 1.0 / index->rel->tuples;
++	}
++	else
++	{
++		/* Estimate the fraction of main-table tuples that will be visited */
++		indexSelectivity = clauselist_selectivity(root, selectivityQuals,
++												  index->rel->relid,
++												  JOIN_INNER,
++												  NULL);
++	}
+ 
+ 	/*
+ 	 * If caller didn't give us an estimate, estimate the number of index
+@@ -7725,8 +7732,6 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 	int			indexcol;
+ 	bool		eqQualHere;
+ 	bool		found_row_compare;
+-	bool		found_array;
+-	bool		found_is_null_op;
+ 	bool		have_correlation = false;
+ 	double		num_sa_scans;
+ 	double		correlation = 0.0;
+@@ -7757,8 +7762,6 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 	indexcol = 0;
+ 	eqQualHere = false;
+ 	found_row_compare = false;
+-	found_array = false;
+-	found_is_null_op = false;
+ 	num_sa_scans = 1;
+ 	foreach(lc, path->indexclauses)
+ 	{
+@@ -7817,8 +7820,6 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 				double		ndistinct;
+ 				bool		isdefault = true;
+ 
+-				found_array = true;
+-
+ 				/*
+ 				 * A skipped attribute's ndistinct forms the basis of our
+ 				 * estimate of the total number of "array elements" used by
+@@ -7990,7 +7991,6 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 				double		alength = estimate_array_length(root, other_operand);
+ 
+ 				clause_op = saop->opno;
+-				found_array = true;
+ 				/* estimate SA descents by indexBoundQuals only */
+ 				if (alength > 1)
+ 					num_sa_scans *= alength;
+@@ -8001,7 +8001,6 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 
+ 				if (nt->nulltesttype == IS_NULL)
+ 				{
+-					found_is_null_op = true;
+ 					/* IS NULL is like = for selectivity/skip scan purposes */
+ 					eqQualHere = true;
+ 				}
+@@ -8034,16 +8033,10 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 	}
+ 
+ 	/*
+-	 * If index is unique and we found an '=' clause for each column, we can
+-	 * just assume numIndexTuples = 1 and skip the expensive
+-	 * clauselist_selectivity calculations.  However, an array or NullTest
+-	 * always invalidates that theory (even when eqQualHere has been set).
++	 * If path is unique, we can just assume numIndexTuples = 1 and skip the
++	 * expensive clauselist_selectivity calculations.
+ 	 */
+-	if (index->unique &&
+-		indexcol == index->nkeycolumns - 1 &&
+-		eqQualHere &&
+-		!found_array &&
+-		!found_is_null_op)
++	if (path->unique_path)
+ 		numIndexTuples = 1.0;
+ 	else
+ 	{
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index 27a2c6815b7..3f5eaf1f248 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -2060,6 +2060,7 @@ typedef struct IndexPath
+ 	ScanDirection indexscandir;
+ 	Cost		indextotalcost;
+ 	Selectivity indexselectivity;
++	bool		unique_path;
+ } IndexPath;
+ 
+ /*
+diff --git a/src/include/optimizer/pathnode.h b/src/include/optimizer/pathnode.h
+index e8db321f92b..682daaaf6f7 100644
+--- a/src/include/optimizer/pathnode.h
++++ b/src/include/optimizer/pathnode.h
+@@ -78,7 +78,8 @@ extern IndexPath *create_index_path(PlannerInfo *root,
+ 									bool indexonly,
+ 									Relids required_outer,
+ 									double loop_count,
+-									bool partial_path);
++									bool partial_path,
++									bool unique_path);
+ extern BitmapHeapPath *create_bitmap_heap_path(PlannerInfo *root,
+ 											   RelOptInfo *rel,
+ 											   Path *bitmapqual,
+diff --git a/src/test/regress/expected/planner_est.out b/src/test/regress/expected/planner_est.out
+index ee0ea22c02c..26bd85e2776 100644
+--- a/src/test/regress/expected/planner_est.out
++++ b/src/test/regress/expected/planner_est.out
+@@ -276,9 +276,9 @@ set enable_seqscan to false;
+ SELECT explain_one_or_more_row($$
+ SELECT * FROM multi_column_unique WHERE a=1 AND b=1;
+ $$);
+-                                   explain_one_or_more_row                                    
+-----------------------------------------------------------------------------------------------
+- Index Scan using multi_column_unique_idx on multi_column_unique  (cost=N..N rows=>1 width=N)
++                                   explain_one_or_more_row                                   
++---------------------------------------------------------------------------------------------
++ Index Scan using multi_column_unique_idx on multi_column_unique  (cost=N..N rows=1 width=N)
+    Index Cond: ((a = 1) AND (b = 1))
+ (2 rows)
+ 
+@@ -286,9 +286,9 @@ $$);
+ SELECT explain_one_or_more_row($$
+ SELECT * FROM multi_column_unique WHERE a=1 AND b=1 AND b=ANY('{1,2,3}');
+ $$);
+-                                   explain_one_or_more_row                                    
+-----------------------------------------------------------------------------------------------
+- Index Scan using multi_column_unique_idx on multi_column_unique  (cost=N..N rows=>1 width=N)
++                                   explain_one_or_more_row                                   
++---------------------------------------------------------------------------------------------
++ Index Scan using multi_column_unique_idx on multi_column_unique  (cost=N..N rows=1 width=N)
+    Index Cond: ((a = 1) AND (b = ANY ('{1,2,3}'::integer[])) AND (b = 1))
+ (2 rows)
+ 
+@@ -355,9 +355,9 @@ $$);
+ SELECT explain_one_or_more_row($$
+ SELECT * FROM multi_column_unique_null_not_distinct WHERE a=1 AND b IS NULL;
+ $$);
+-                                                        explain_one_or_more_row                                                        
+----------------------------------------------------------------------------------------------------------------------------------------
+- Index Only Scan using multi_column_unique_null_not_distinct_idx on multi_column_unique_null_not_distinct  (cost=N..N rows=>1 width=N)
++                                                       explain_one_or_more_row                                                        
++--------------------------------------------------------------------------------------------------------------------------------------
++ Index Only Scan using multi_column_unique_null_not_distinct_idx on multi_column_unique_null_not_distinct  (cost=N..N rows=1 width=N)
+    Index Cond: ((a = 1) AND (b IS NULL))
+ (2 rows)
+ 
+@@ -367,9 +367,9 @@ $$);
+ SELECT explain_one_or_more_row($$
+ SELECT * FROM multi_column_unique_deferred WHERE a=1 AND b=1;
+ $$);
+-                                               explain_one_or_more_row                                               
+----------------------------------------------------------------------------------------------------------------------
+- Index Only Scan using multi_column_unique_deferred_idx on multi_column_unique_deferred  (cost=N..N rows=>1 width=N)
++                                              explain_one_or_more_row                                               
++--------------------------------------------------------------------------------------------------------------------
++ Index Only Scan using multi_column_unique_deferred_idx on multi_column_unique_deferred  (cost=N..N rows=1 width=N)
+    Index Cond: ((a = 1) AND (b = 1))
+ (2 rows)
+ 
+@@ -377,9 +377,9 @@ $$);
+ SELECT explain_one_or_more_row($$
+ SELECT * FROM multi_column_unique_partial WHERE a=1 AND b=11;
+ $$);
+-                                              explain_one_or_more_row                                              
+--------------------------------------------------------------------------------------------------------------------
+- Index Only Scan using multi_column_unique_partial_idx on multi_column_unique_partial  (cost=N..N rows=>1 width=N)
++                                             explain_one_or_more_row                                              
++------------------------------------------------------------------------------------------------------------------
++ Index Only Scan using multi_column_unique_partial_idx on multi_column_unique_partial  (cost=N..N rows=1 width=N)
+    Index Cond: ((a = 1) AND (b = 11))
+ (2 rows)
+ 
+-- 
+2.54.0
+

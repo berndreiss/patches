@@ -1,0 +1,273 @@
+From dc83f608774f8df9dbe10fc092b10cba9fcedf4b Mon Sep 17 00:00:00 2001
+From: Lukas Fittl <lukas@fittl.com>
+Date: Thu, 29 Oct 2026 14:24:19 -0700
+Subject: [PATCH v1] pgstat: Don't double count parallel worker activity in WAL
+ statistics
+
+Each parallel worker tracks its own activity in its copy of the global
+instrumentation counters (pgWalUsage/pgBufferUsage), reports the delta
+through shared memory when it finishes, and the leader then accumulates
+that into its copy of the globals (InstrAccumParallelQuery).
+
+Having the same activity in the globals of two processes was acceptable
+when the globals were only used for statement-level reporting, where the
+worker globals are effectively ignored. That stopped being true when
+commit 01469241b2f started diffing pgWalUsage to report WAL activity to
+the cumulative statistics system. This caused a bug with parallel workers
+double reporting their WAL in pg_stat_wal, once via the leader and once
+via the worker, leading to incorrect data for utility statements like
+parallel vacuum, and queries that cause pruning or update hint bits, e.g.
+in a parallel sequential scan. The same bug applies to the per-backend
+cumulative statistics accessible via pg_stat_get_backend_wal().
+
+To fix, remember the cumulative total of WAL/buffer statistics that we
+have imported from the workers into the leader, and subtract it when
+reporting to the cumulative statistics system. That way each worker
+reports its activity itself, exactly once.
+
+Author: Lukas Fittl <lukas@fittl.com>
+Reviewed-by:
+Discussion:
+---
+ src/backend/executor/instrument.c           | 24 +++++++++++++++-
+ src/backend/utils/activity/pgstat_backend.c | 29 +++++++++++--------
+ src/backend/utils/activity/pgstat_wal.c     | 31 +++++++++++++--------
+ src/include/executor/instrument.h           | 12 ++++++++
+ 4 files changed, 73 insertions(+), 23 deletions(-)
+
+diff --git a/src/backend/executor/instrument.c b/src/backend/executor/instrument.c
+index ffbcd572133..8da0fecf3ac 100644
+--- a/src/backend/executor/instrument.c
++++ b/src/backend/executor/instrument.c
+@@ -23,8 +23,10 @@
+ #include "utils/guc_hooks.h"
+ 
+ BufferUsage pgBufferUsage;
++BufferUsage pgBufferUsageFromWorkers;
+ static BufferUsage save_pgBufferUsage;
+ WalUsage	pgWalUsage;
++WalUsage	pgWalUsageFromWorkers;
+ static WalUsage save_pgWalUsage;
+ 
+ static void BufferUsageAdd(BufferUsage *dst, const BufferUsage *add);
+@@ -292,12 +294,32 @@ InstrEndParallelQuery(BufferUsage *bufusage, WalUsage *walusage)
+ 	WalUsageAccumDiff(walusage, &pgWalUsage, &save_pgWalUsage);
+ }
+ 
+-/* accumulate work done by workers in leader's stats */
++/*
++ * Accumulate work done by workers in leader's stats.
++ *
++ * Also keep track of how much of the leader's totals came from workers, so
++ * that consumers that feed the cumulative statistics system can separate the
++ * leader only activity (by subtracting the worker activity from the totals)
++ * to avoid double counting due to workers also reporting it themselves.
++ */
+ void
+ InstrAccumParallelQuery(BufferUsage *bufusage, WalUsage *walusage)
+ {
+ 	BufferUsageAdd(&pgBufferUsage, bufusage);
+ 	WalUsageAdd(&pgWalUsage, walusage);
++	BufferUsageAdd(&pgBufferUsageFromWorkers, bufusage);
++	WalUsageAdd(&pgWalUsageFromWorkers, walusage);
++}
++
++/*
++ * Compute this process' own WAL usage into *walusage: pgWalUsage less what a
++ * parallel leader accumulated from its workers.
++ */
++void
++ComputeOwnWalUsage(WalUsage *walusage)
++{
++	memset(walusage, 0, sizeof(WalUsage));
++	WalUsageAccumDiff(walusage, &pgWalUsage, &pgWalUsageFromWorkers);
+ }
+ 
+ /* dst += add */
+diff --git a/src/backend/utils/activity/pgstat_backend.c b/src/backend/utils/activity/pgstat_backend.c
+index b736b2ccc6f..32ec6d658a7 100644
+--- a/src/backend/utils/activity/pgstat_backend.c
++++ b/src/backend/utils/activity/pgstat_backend.c
+@@ -42,10 +42,12 @@ static bool backend_has_iostats = false;
+ static bool backend_has_lockstats = false;
+ 
+ /*
+- * WAL usage counters saved from pgWalUsage at the previous call to
+- * pgstat_flush_backend().  This is used to calculate how much WAL usage
+- * happens between pgstat_flush_backend() calls, by subtracting the
+- * previous counters from the current ones.
++ * WAL usage counters saved at the previous call to pgstat_flush_backend().
++ * This is used to calculate how much WAL usage happens between
++ * pgstat_flush_backend() calls, by subtracting the previous counters from the
++ * current ones.  As in pgstat_wal.c, these are this process' own counters
++ * (ComputeOwnWalUsage), excluding what a parallel leader accumulated from its
++ * workers.
+  */
+ static WalUsage prevBackendWalUsage;
+ 
+@@ -250,7 +252,10 @@ pgstat_flush_backend_entry_io(PgStat_EntryRef *entry_ref)
+ static inline bool
+ pgstat_backend_wal_have_pending(void)
+ {
+-	return (pgWalUsage.wal_records != prevBackendWalUsage.wal_records);
++	WalUsage	walusage;
++
++	ComputeOwnWalUsage(&walusage);
++	return (walusage.wal_records != prevBackendWalUsage.wal_records);
+ }
+ 
+ /*
+@@ -262,6 +267,7 @@ pgstat_flush_backend_entry_wal(PgStat_EntryRef *entry_ref)
+ {
+ 	PgStatShared_Backend *shbackendent;
+ 	PgStat_WalCounters *bktype_shstats;
++	WalUsage	walusage;
+ 	WalUsage	wal_usage_diff = {0};
+ 
+ 	/*
+@@ -279,7 +285,8 @@ pgstat_flush_backend_entry_wal(PgStat_EntryRef *entry_ref)
+ 	 * Calculate how much WAL usage counters were increased by subtracting the
+ 	 * previous counters from the current ones.
+ 	 */
+-	WalUsageAccumDiff(&wal_usage_diff, &pgWalUsage, &prevBackendWalUsage);
++	ComputeOwnWalUsage(&walusage);
++	WalUsageAccumDiff(&wal_usage_diff, &walusage, &prevBackendWalUsage);
+ 
+ #define WALSTAT_ACC(fld, var_to_add) \
+ 	(bktype_shstats->fld += var_to_add.fld)
+@@ -293,7 +300,7 @@ pgstat_flush_backend_entry_wal(PgStat_EntryRef *entry_ref)
+ 	/*
+ 	 * Save the current counters for the subsequent calculation of WAL usage.
+ 	 */
+-	prevBackendWalUsage = pgWalUsage;
++	prevBackendWalUsage = walusage;
+ }
+ 
+ /*
+@@ -413,11 +420,11 @@ pgstat_create_backend(ProcNumber procnum)
+ 	backend_has_lockstats = false;
+ 
+ 	/*
+-	 * Initialize prevBackendWalUsage with pgWalUsage so that
+-	 * pgstat_backend_flush_cb() can calculate how much pgWalUsage counters
+-	 * are increased by subtracting prevBackendWalUsage from pgWalUsage.
++	 * Initialize prevBackendWalUsage with the current counters so that
++	 * pgstat_backend_flush_cb() can calculate how much they are increased by
++	 * subtracting prevBackendWalUsage from them.
+ 	 */
+-	prevBackendWalUsage = pgWalUsage;
++	ComputeOwnWalUsage(&prevBackendWalUsage);
+ }
+ 
+ /*
+diff --git a/src/backend/utils/activity/pgstat_wal.c b/src/backend/utils/activity/pgstat_wal.c
+index 183e0a7a97b..6ef8fbb9bf2 100644
+--- a/src/backend/utils/activity/pgstat_wal.c
++++ b/src/backend/utils/activity/pgstat_wal.c
+@@ -22,10 +22,14 @@
+ 
+ 
+ /*
+- * WAL usage counters saved from pgWalUsage at the previous call to
+- * pgstat_report_wal(). This is used to calculate how much WAL usage
+- * happens between pgstat_report_wal() calls, by subtracting
+- * the previous counters from the current ones.
++ * WAL usage counters saved at the previous call to pgstat_report_wal(). This
++ * is used to calculate how much WAL usage happens between pgstat_report_wal()
++ * calls, by subtracting the previous counters from the current ones.
++ *
++ * The counters are this process' own WAL usage (ComputeOwnWalUsage), i.e. without
++ * what a parallel leader accumulated from its workers into pgWalUsage: the
++ * workers report their own activity themselves, so counting it here as well
++ * would count it twice.
+  */
+ static WalUsage prevWalUsage;
+ 
+@@ -77,7 +81,10 @@ pgstat_fetch_stat_wal(void)
+ static inline bool
+ pgstat_wal_have_pending(void)
+ {
+-	return pgWalUsage.wal_records != prevWalUsage.wal_records;
++	WalUsage	walusage;
++
++	ComputeOwnWalUsage(&walusage);
++	return walusage.wal_records != prevWalUsage.wal_records;
+ }
+ 
+ /*
+@@ -91,6 +98,7 @@ bool
+ pgstat_wal_flush_cb(bool nowait)
+ {
+ 	PgStatShared_Wal *stats_shmem = &pgStatLocal.shmem->wal;
++	WalUsage	walusage;
+ 	WalUsage	wal_usage_diff = {0};
+ 
+ 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
+@@ -109,7 +117,8 @@ pgstat_wal_flush_cb(bool nowait)
+ 	 * Calculate how much WAL usage counters were increased by subtracting the
+ 	 * previous counters from the current ones.
+ 	 */
+-	WalUsageAccumDiff(&wal_usage_diff, &pgWalUsage, &prevWalUsage);
++	ComputeOwnWalUsage(&walusage);
++	WalUsageAccumDiff(&wal_usage_diff, &walusage, &prevWalUsage);
+ 
+ 	if (!nowait)
+ 		LWLockAcquire(&stats_shmem->lock, LW_EXCLUSIVE);
+@@ -130,7 +139,7 @@ pgstat_wal_flush_cb(bool nowait)
+ 	/*
+ 	 * Save the current counters for the subsequent calculation of WAL usage.
+ 	 */
+-	prevWalUsage = pgWalUsage;
++	prevWalUsage = walusage;
+ 
+ 	return false;
+ }
+@@ -139,11 +148,11 @@ void
+ pgstat_wal_init_backend_cb(void)
+ {
+ 	/*
+-	 * Initialize prevWalUsage with pgWalUsage so that pgstat_wal_flush_cb()
+-	 * can calculate how much pgWalUsage counters are increased by subtracting
+-	 * prevWalUsage from pgWalUsage.
++	 * Initialize prevWalUsage with the current counters so that
++	 * pgstat_wal_flush_cb() can calculate how much they are increased by
++	 * subtracting prevWalUsage from them.
+ 	 */
+-	prevWalUsage = pgWalUsage;
++	ComputeOwnWalUsage(&prevWalUsage);
+ }
+ 
+ void
+diff --git a/src/include/executor/instrument.h b/src/include/executor/instrument.h
+index f093a52aae0..525271ead82 100644
+--- a/src/include/executor/instrument.h
++++ b/src/include/executor/instrument.h
+@@ -128,6 +128,17 @@ typedef struct TriggerInstrumentation
+ extern PGDLLIMPORT BufferUsage pgBufferUsage;
+ extern PGDLLIMPORT WalUsage pgWalUsage;
+ 
++/*
++ * The portion of pgBufferUsage/pgWalUsage that a parallel leader accumulated
++ * from its workers (see InstrAccumParallelQuery).  Query-level consumers want
++ * the workers' activity included, which is why it is folded into the globals
++ * above, but a session-level consumer that must count each process' activity
++ * exactly once, such as the cumulative statistics system, has to subtract it
++ * out again, as the workers report their activity themselves.
++ */
++extern PGDLLIMPORT BufferUsage pgBufferUsageFromWorkers;
++extern PGDLLIMPORT WalUsage pgWalUsageFromWorkers;
++
+ extern Instrumentation *InstrAlloc(int instrument_options);
+ extern void InstrInitOptions(Instrumentation *instr, int instrument_options);
+ extern void InstrStart(Instrumentation *instr);
+@@ -150,6 +161,7 @@ extern void InstrStopTrigger(TriggerInstrumentation *tginstr, int64 firings);
+ extern void InstrStartParallelQuery(void);
+ extern void InstrEndParallelQuery(BufferUsage *bufusage, WalUsage *walusage);
+ extern void InstrAccumParallelQuery(BufferUsage *bufusage, WalUsage *walusage);
++extern void ComputeOwnWalUsage(WalUsage *walusage);
+ extern void BufferUsageAccumDiff(BufferUsage *dst,
+ 								 const BufferUsage *add, const BufferUsage *sub);
+ extern void WalUsageAccumDiff(WalUsage *dst, const WalUsage *add,
+-- 
+2.53.0
+
